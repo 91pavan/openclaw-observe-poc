@@ -1,0 +1,110 @@
+# OpenClaw Observe PoC
+
+
+## Initial Approach: Custom Hook-Based Plugin
+
+For **deeper observability**, install the custom plugin from this repo. It uses OpenClaw's typed plugin hooks to capture the full agent lifecycle.
+
+### What It Adds
+
+**Connected Traces:**
+```
+openclaw.request (root span)
+├── openclaw.agent.turn
+│   ├── tool.Read (file read)
+│   ├── tool.exec (shell command)  
+│   ├── tool.Write (file write)
+│   └── tool.web_search
+└── (child spans connected via trace context)
+```
+
+**Per-Tool Visibility:**
+- Individual spans for each tool call
+- Tool execution time
+- Result size (characters)
+- Error tracking per tool
+
+**Request Lifecycle:**
+- Full message → response tracing
+- Session context propagation
+- Agent turn duration with token breakdown
+
+### Installation
+
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/91pavan/openclaw-observe-poc.git
+   ```
+
+2. Add to your `openclaw.json`:
+   ```json
+   {
+     "plugins": {
+       "load": {
+         "paths": ["/path/to/openclaw-observe-poc"]
+       },
+       "entries": {
+         "otel-observe-poc": {
+           "enabled": true,
+           "config": {
+             "endpoint": "http://localhost:4318",
+             "serviceName": "openclaw-gateway"
+           }
+         }
+       }
+     }
+   }
+   ```
+
+3. Restart gateway:
+   ```bash
+   openclaw gateway restart
+   ```
+
+---
+
+## Comparing the Two Approaches
+
+| Feature | Official Plugin | Custom Plugin |
+|---------|-----------------|---------------|
+| Token metrics | ✅ Per model | ✅ Per session + model |
+| Cost tracking | ✅ Yes | ✅ Yes (from diagnostics) |
+| Gateway health | ✅ Webhooks, queues, sessions | ❌ Not focused |
+| Session state | ✅ State transitions | ❌ Not tracked |
+| **Tool call tracing** | ❌ No | ✅ Individual tool spans |
+| **Request lifecycle** | ❌ No | ✅ Full request → response |
+| **Connected traces** | ❌ Separate spans | ✅ Parent-child hierarchy |
+| Setup complexity | 🟢 Config only | 🟡 Plugin installation |
+
+---
+
+## Configuration Reference
+
+### Official Plugin Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `diagnostics.enabled` | boolean | false | Enable diagnostics system |
+| `diagnostics.otel.enabled` | boolean | false | Enable OTel export |
+| `diagnostics.otel.endpoint` | string | — | OTLP endpoint URL |
+| `diagnostics.otel.protocol` | string | "http/protobuf" | Protocol |
+| `diagnostics.otel.headers` | object | — | Custom headers |
+| `diagnostics.otel.serviceName` | string | "openclaw" | Service name |
+| `diagnostics.otel.traces` | boolean | true | Enable traces |
+| `diagnostics.otel.metrics` | boolean | true | Enable metrics |
+| `diagnostics.otel.logs` | boolean | false | Enable logs |
+| `diagnostics.otel.sampleRate` | number | 1.0 | Trace sampling (0-1) |
+
+### Custom Plugin Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `endpoint` | string | — | OTLP endpoint URL |
+| `serviceName` | string | "openclaw-gateway" | Service name |
+| `exporterType` | string | "otlp" | Exporter type |
+| `enableTraces` | boolean | true | Enable traces |
+| `enableMetrics` | boolean | true | Enable metrics |
+
+---
+
+
