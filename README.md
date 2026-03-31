@@ -61,6 +61,58 @@ openclaw.request (root span)
    openclaw gateway restart
    ```
 
+### Enable GenAI SDK Auto-Instrumentation
+
+The plugin's hook-based spans work on their own, but provider SDK auto-instrumentation
+for Anthropic, OpenAI, Bedrock, and Vertex AI is enabled through the preload entrypoint in
+`instrumentation/preload.mjs`.
+
+This preload runs before OpenClaw imports the provider SDKs, which is required for
+`import-in-the-middle` to patch the modules correctly.
+
+1. Install dependencies:
+  ```bash
+  npm install
+  ```
+
+2. Start OpenClaw with the preload enabled:
+  ```bash
+  export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+  export OTEL_SERVICE_NAME=openclaw-gateway
+  export NODE_OPTIONS="--import ./instrumentation/preload.mjs"
+
+  openclaw gateway start
+  ```
+
+### Supported Provider SDKs
+
+- Anthropic
+- OpenAI
+- Amazon Bedrock
+- Google Vertex AI
+
+### Gemini Note
+
+There is no separate Traceloop package for the standalone Gemini JavaScript SDK at the moment.
+If you are accessing Gemini through Vertex AI, the Vertex AI instrumentation path applies.
+If you are using the standalone Google GenAI SDK directly, this repo does not currently auto-instrument
+that SDK.
+
+4. Verify startup logs:
+  ```text
+  [otel-preload] GenAI instrumentation active (providers=anthropic,bedrock,openai,vertexai, ...)
+  [otel] ✅ GenAI instrumentation active via NODE_OPTIONS preload
+  ```
+
+### Why Preload Is Required
+
+The plugin itself runs in a different module-loading context from the provider SDKs.
+Patching provider SDKs from inside the plugin is too late and does not affect the
+ESM module instances OpenClaw is already using.
+
+Using `NODE_OPTIONS=--import .../preload.mjs` fixes that by registering the ESM loader
+hook before the SDKs are imported.
+
 ---
 
 ## Comparing the Two Approaches

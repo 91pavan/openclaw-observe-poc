@@ -24,7 +24,17 @@ const { OTLPTraceExporter } = await import("@opentelemetry/exporter-trace-otlp-p
 const { BatchSpanProcessor } = await import("@opentelemetry/sdk-trace-node");
 const { resourceFromAttributes } = await import("@opentelemetry/resources");
 const { AnthropicInstrumentation } = await import("@traceloop/instrumentation-anthropic");
+const { BedrockInstrumentation } = await import("@traceloop/instrumentation-bedrock");
 const { OpenAIInstrumentation } = await import("@traceloop/instrumentation-openai");
+const { VertexAIInstrumentation } = await import("@traceloop/instrumentation-vertexai");
+
+const providerInstrumentations = [
+  new AnthropicInstrumentation({ traceContent: false }),
+  new BedrockInstrumentation({ traceContent: false }),
+  new OpenAIInstrumentation({ traceContent: false }),
+  new VertexAIInstrumentation({ traceContent: false }),
+];
+const providerNames = ["anthropic", "bedrock", "openai", "vertexai"];
 
 const OTLP_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://localhost:4318";
 const SERVICE_NAME = process.env.OTEL_SERVICE_NAME || "openclaw-gateway";
@@ -42,10 +52,7 @@ const traceExporter = new OTLPTraceExporter({
 const sdk = new NodeSDK({
   resource,
   spanProcessors: [new BatchSpanProcessor(traceExporter)],
-  instrumentations: [
-    new AnthropicInstrumentation({ traceContent: false }),
-    new OpenAIInstrumentation({ traceContent: false }),
-  ],
+  instrumentations: providerInstrumentations,
 });
 
 sdk.start();
@@ -56,4 +63,6 @@ globalThis.__OPENCLAW_OTEL_PRELOAD_ACTIVE = true;
 process.on("SIGTERM", () => sdk.shutdown());
 process.on("SIGINT", () => sdk.shutdown());
 
-console.log(`[otel-preload] GenAI instrumentation active (endpoint=${OTLP_ENDPOINT}, IITM loader registered)`);
+console.log(
+  `[otel-preload] GenAI instrumentation active (providers=${providerNames.join(",")}, endpoint=${OTLP_ENDPOINT}, IITM loader registered)`
+);
