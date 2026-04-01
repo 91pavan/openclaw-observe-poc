@@ -34,6 +34,7 @@ import { initTelemetry, type TelemetryRuntime } from "./src/telemetry.js";
 import { initOpenLLMetry } from "./src/openllmetry.js";
 import { registerHooks } from "./src/hooks.js";
 import { registerDiagnosticsListener, hasDiagnosticsSupport } from "./src/diagnostics.js";
+import { startSessionWatcher, stopSessionWatcher } from "./src/session-lifecycle.js";
 
 const otelObservabilityPlugin = {
   id: "otel-observe-poc",
@@ -93,7 +94,9 @@ const otelObservabilityPlugin = {
             console.log(`  Capture content: ${config.captureContent ? "✅" : "❌"}`);
             console.log(`  Initialized:     ${telemetry ? "✅" : "❌"}`);
             console.log(`  Cost tracking:   ${hasDiagnosticsSupport() ? "✅ (via diagnostics API)" : "❌"}`);
-
+            console.log(`  Agent handoff:   ✅ (span links)`);
+            console.log(`  Fork/join:       ✅ (parallel tool detection)`);
+            console.log(`  Session lifecycle: ✅ (auto session.end)`);
           });
       },
       { commands: ["otel"] }
@@ -121,7 +124,10 @@ const otelObservabilityPlugin = {
         // 3. Register hooks for tool results and command events
         registerHooks(api, telemetry, config);
 
-        // 4. Subscribe to OpenClaw diagnostic events (model.usage, etc.)
+        // 4. Start session lifecycle watcher (auto session.end detection)
+        startSessionWatcher(telemetry.tracer, logger);
+
+        // 5. Subscribe to OpenClaw diagnostic events (model.usage, etc.)
         //    This gives us cost data and accurate token counts
         unsubscribeDiagnostics = await registerDiagnosticsListener(telemetry, logger);
         if (hasDiagnosticsSupport()) {
@@ -140,6 +146,7 @@ const otelObservabilityPlugin = {
           unsubscribeDiagnostics();
           unsubscribeDiagnostics = null;
         }
+        stopSessionWatcher();
         if (telemetry) {
           await telemetry.shutdown();
           telemetry = null;
