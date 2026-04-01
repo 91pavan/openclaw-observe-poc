@@ -37,8 +37,16 @@ interface SessionTraceContext {
   startTime: number;
 }
 
+interface PendingInboundContext {
+  channel: string;
+  from: string;
+  messageText: string;
+  observedAt: number;
+}
+
 /** Map of sessionKey → active trace context. Cleaned up on agent_end. */
 const sessionContextMap = new Map<string, SessionTraceContext>();
+const pendingInboundMap = new Map<string, PendingInboundContext>();
 
 function resolveInboundChannel(event: any, ctx: any): string {
   return event?.channel || event?.channelId || ctx?.channelId || "unknown";
@@ -91,6 +99,20 @@ function ensureRootSpan(params: {
   return sessionTraceContext;
 }
 
+function observeInboundMessage(params: {
+  channel: string;
+  sessionKey: string;
+  from: string;
+  messageText: string;
+}): void {
+  pendingInboundMap.set(params.sessionKey, {
+    channel: params.channel,
+    from: params.from,
+    messageText: params.messageText,
+    observedAt: Date.now(),
+  });
+}
+
 /**
  * Register all plugin hooks on the OpenClaw plugin API.
  */
@@ -127,23 +149,13 @@ export function registerHooks(
         const from = resolveInboundSender(event);
         const messageText = resolveInboundMessageText(event);
 
-        // Newer OpenClaw builds do not expose sessionKey on message_received.
-        // Defer root-span creation until before_dispatch in that case.
-        const rootSpan = sessionKey
-          ? ensureRootSpan({ tracer, sessionKey, channel, from }).rootSpan
-          : undefined;
-
-        // ═══ SECURITY DETECTION 2: Prompt Injection ═══════════════
-        if (rootSpan && messageText.length > 0) {
-          const securityEvent = checkMessageSecurity(
+        if (sessionKey) {
+          observeInboundMessage({
+            channel,
+            sessionKey,
+            from,
             messageText,
-            rootSpan,
-            securityCounters,
-            sessionKey || "unknown"
-          );
-          if (securityEvent) {
-            logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
-          }
+          });
         }
 
         // Record message count metric
@@ -156,6 +168,10 @@ export function registerHooks(
         } else {
           logger.debug?.("[otel] Inbound message observed before session binding was available");
         }
+
+        logger.info(
+          `[otel] message_received: channel=${channel} session=${sessionKey || "<pending>"} from=${from}`
+        );
       } catch {
         // Never let telemetry errors break the main flow
       }
@@ -166,7 +182,7 @@ export function registerHooks(
   logger.info("[otel] Registered message_received hook (via api.on)");
 
   // ── before_dispatch ──────────────────────────────────────────────
-  // Creates the root span once routing/session metadata has been resolved.
+  // Records session-bound inbound context once routing metadata is resolved.
 
   api.on(
     "before_dispatch",
@@ -184,22 +200,12 @@ export function registerHooks(
           event?.from ||
           "unknown";
         const messageText = resolveInboundMessageText(event);
-        const hadSessionContext = sessionContextMap.has(sessionKey);
-        const sessionCtx = ensureRootSpan({ tracer, sessionKey, channel, from });
+        observeInboundMessage({ channel, sessionKey, from, messageText });
 
-        if (!hadSessionContext && messageText.length > 0) {
-          const securityEvent = checkMessageSecurity(
-            messageText,
-            sessionCtx.rootSpan,
-            securityCounters,
-            sessionKey
-          );
-          if (securityEvent) {
-            logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
-          }
-        }
-
-        logger.debug?.(`[otel] Root span ready for session=${sessionKey}`);
+        logger.debug?.(`[otel] Inbound context ready for session=${sessionKey}`);
+        logger.info(
+          `[otel] before_dispatch: session=${sessionKey} channel=${channel} pending_inbound=true`
+        );
       } catch {
         // Never let telemetry errors break the main flow
       }
@@ -221,6 +227,29 @@ export function registerHooks(
         const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const model = event?.model || "unknown";
+        const pendingInbound = sessionKey !== "unknown" ? pendingInboundMap.get(sessionKey) : undefined;
+
+        if (pendingInbound && !sessionContextMap.has(sessionKey)) {
+          const sessionTraceContext = ensureRootSpan({
+            tracer,
+            sessionKey,
+            channel: pendingInbound.channel,
+            from: pendingInbound.from,
+          });
+          sessionTraceContext.startTime = pendingInbound.observedAt;
+
+          if (pendingInbound.messageText.length > 0) {
+            const securityEvent = checkMessageSecurity(
+              pendingInbound.messageText,
+              sessionTraceContext.rootSpan,
+              securityCounters,
+              sessionKey
+            );
+            if (securityEvent) {
+              logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
+            }
+          }
+        }
 
         const sessionCtx = sessionContextMap.get(sessionKey);
         const parentContext = sessionCtx?.rootContext || context.active();
@@ -258,8 +287,14 @@ export function registerHooks(
 
         // Register in activeAgentSpans for diagnostics integration
         activeAgentSpans.set(sessionKey, agentSpan);
+        if (sessionKey !== "unknown") {
+          pendingInboundMap.delete(sessionKey);
+        }
 
         logger.debug?.(`[otel] Agent turn span started: agent=${agentId}, session=${sessionKey}`);
+        logger.info(
+          `[otel] before_agent_start: agent=${agentId} session=${sessionKey} agent_span=${agentSpan.spanContext().spanId}`
+        );
       } catch {
         // Silently ignore
       }
@@ -514,8 +549,12 @@ export function registerHooks(
         // Clean up
         sessionContextMap.delete(sessionKey);
         activeAgentSpans.delete(sessionKey);
+        pendingInboundMap.delete(sessionKey);
 
         logger.debug?.(`[otel] Trace completed for session=${sessionKey}`);
+        logger.info(
+          `[otel] agent_end: session=${sessionKey} success=${success} tokens=${totalTokens} model=${model}`
+        );
       } catch {
         // Silently ignore
       }
@@ -603,7 +642,7 @@ export function registerHooks(
   logger.info("[otel] Registered gateway:startup hook (via api.registerHook)");
 
   // ── Periodic cleanup ─────────────────────────────────────────────
-  // Safety net: clean up stale session contexts (e.g., if agent_end never fires)
+  // Safety net: clean up stale session contexts and abandoned pending inbound records.
   setInterval(() => {
     const now = Date.now();
     const maxAge = 5 * 60 * 1000; // 5 minutes
@@ -615,6 +654,12 @@ export function registerHooks(
         } catch { /* ignore */ }
         sessionContextMap.delete(key);
         logger.debug?.(`[otel] Cleaned up stale trace context for session=${key}`);
+      }
+    }
+    for (const [key, pending] of pendingInboundMap) {
+      if (now - pending.observedAt > maxAge) {
+        pendingInboundMap.delete(key);
+        logger.debug?.(`[otel] Cleaned up stale pending inbound context for session=${key}`);
       }
     }
   }, 60_000);
