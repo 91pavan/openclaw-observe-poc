@@ -44,7 +44,7 @@ import {
   ATTR_OBSERVE_ENTITY_INPUT,
   ATTR_OBSERVE_ENTITY_OUTPUT,
 } from "./observe-attributes.js";
-import { touchSession, endSession } from "./session-lifecycle.js";
+import { touchSession, endSession, removeSession } from "./session-lifecycle.js";
 
 /** Active trace context for a session — allows connecting spans into one trace. */
 interface ToolSpanContext {
@@ -61,12 +61,39 @@ interface SessionTraceContext {
   llmSpan?: Span;
   toolSpans: Map<string, ToolSpanContext>;
   toolSpanSequence: number;
+  rootEnded?: boolean;
+  agentEnded?: boolean;
   startTime: number;
 }
 
 /** Map of sessionKey → active trace context. Cleaned up on agent_end. */
 const sessionContextMap = new Map<string, SessionTraceContext>();
 const recentToolCompletions = new Map<string, number>();
+const UNKNOWN_SESSION_KEY = "unknown";
+
+function normalizeString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const normalized = normalizeString(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return undefined;
+}
+
+function isUnknownSessionKey(sessionKey: string | undefined): boolean {
+  return !sessionKey || sessionKey === UNKNOWN_SESSION_KEY;
+}
 
 function ensureStandaloneSessionContext(
   tracer: TelemetryRuntime["tracer"],
@@ -104,6 +131,62 @@ function getParentContext(sessionCtx: SessionTraceContext | undefined): Context 
   return sessionCtx?.agentContext || sessionCtx?.rootContext || context.active();
 }
 
+function resolveSessionKey(event: any, ctx: any): string {
+  return (
+    firstString(
+      event?.sessionKey,
+      ctx?.sessionKey,
+      event?.sessionId,
+      ctx?.sessionId,
+      event?.conversationId,
+      ctx?.conversationId,
+      event?.conversation?.id,
+      ctx?.conversation?.id,
+      event?.threadId,
+      ctx?.threadId,
+      event?.thread?.id,
+      ctx?.thread?.id,
+      event?.metadata?.sessionKey,
+      ctx?.metadata?.sessionKey,
+      event?.metadata?.sessionId,
+      ctx?.metadata?.sessionId,
+      event?.metadata?.conversationId,
+      ctx?.metadata?.conversationId,
+      event?.metadata?.threadId,
+      ctx?.metadata?.threadId,
+      event?.message?.sessionKey,
+      ctx?.message?.sessionKey,
+      event?.message?.sessionId,
+      ctx?.message?.sessionId,
+      event?.message?.conversationId,
+      ctx?.message?.conversationId,
+      event?.body?.sessionKey,
+      ctx?.body?.sessionKey,
+      event?.body?.conversationId,
+      ctx?.body?.conversationId
+    ) || UNKNOWN_SESSION_KEY
+  );
+}
+
+function resolveChannel(event: any, ctx: any): string {
+  return event?.channel || event?.channelId || ctx?.channelId || ctx?.messageProvider || "unknown";
+}
+
+function resolveSender(event: any, ctx: any): string {
+  return (
+    event?.from ||
+    event?.senderId ||
+    event?.metadata?.senderId ||
+    event?.metadata?.from ||
+    ctx?.accountId ||
+    "unknown"
+  );
+}
+
+function resolveRecipient(event: any, ctx: any): string {
+  return event?.to || event?.recipient || event?.metadata?.to || ctx?.accountId || "unknown";
+}
+
 function stringifyContent(value: unknown): string | undefined {
   if (typeof value === "string") {
     return value;
@@ -137,6 +220,71 @@ function extractLlmOutputText(event: any): string | undefined {
     stringifyContent(event?.content) ||
     stringifyContent(event?.lastAssistant?.content)
   );
+}
+
+function extractInboundMessageText(event: any): string {
+  return stringifyContent(event?.content) || event?.text || event?.message || event?.body || event?.bodyForAgent || "";
+}
+
+function endRootSpan(sessionCtx: SessionTraceContext | undefined, errorMsg?: unknown): void {
+  if (!sessionCtx || sessionCtx.rootEnded) {
+    return;
+  }
+
+  const totalMs = Date.now() - sessionCtx.startTime;
+  sessionCtx.rootSpan.setAttribute("openclaw.request.duration_ms", totalMs);
+  if (errorMsg) {
+    sessionCtx.rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(errorMsg).slice(0, 200) });
+  } else {
+    sessionCtx.rootSpan.setStatus({ code: SpanStatusCode.OK });
+  }
+  sessionCtx.rootSpan.end();
+  sessionCtx.rootEnded = true;
+}
+
+function adoptPendingUnknownSession(
+  sessionKey: string,
+  logger: any
+): SessionTraceContext | undefined {
+  if (isUnknownSessionKey(sessionKey)) {
+    return sessionContextMap.get(UNKNOWN_SESSION_KEY);
+  }
+
+  const existing = sessionContextMap.get(sessionKey);
+  if (existing) {
+    return existing;
+  }
+
+  const unknownSession = sessionContextMap.get(UNKNOWN_SESSION_KEY);
+  if (!unknownSession || unknownSession.agentSpan || unknownSession.rootEnded) {
+    return undefined;
+  }
+
+  sessionContextMap.delete(UNKNOWN_SESSION_KEY);
+  unknownSession.rootSpan.setAttribute("openclaw.session.key", sessionKey);
+  sessionContextMap.set(sessionKey, unknownSession);
+
+  removeSession(UNKNOWN_SESSION_KEY);
+  touchSession(sessionKey, unknownSession.rootContext);
+
+  logger.info?.(
+    `[otel] Reconciled inbound request session: ${UNKNOWN_SESSION_KEY} -> ${sessionKey}`
+  );
+
+  return unknownSession;
+}
+
+function getOrCreateSessionContext(
+  tracer: TelemetryRuntime["tracer"],
+  sessionKey: string,
+  logger: any
+): SessionTraceContext {
+  const adopted = adoptPendingUnknownSession(sessionKey, logger);
+  if (adopted) {
+    return adopted;
+  }
+
+  return ensureStandaloneSessionContext(tracer, sessionKey);
 }
 
 function getToolSpanKey(params: {
@@ -268,10 +416,14 @@ export function registerHooks(
     "message_received",
     async (event: any, ctx: any) => {
       try {
-        const channel = event?.channel || "unknown";
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
-        const from = event?.from || event?.senderId || "unknown";
-        const messageText = event?.text || event?.message || "";
+        const channel = resolveChannel(event, ctx);
+        const sessionKey = resolveSessionKey(event, ctx);
+        const from = resolveSender(event, ctx);
+        const messageText = extractInboundMessageText(event);
+
+        logger.debug?.(
+          `[otel] message_received resolved session=${sessionKey}, channel=${channel}, from=${from}`
+        );
 
         // Create root span for this request
         const rootSpan = tracer.startSpan("openclaw.request", {
@@ -340,9 +492,9 @@ export function registerHooks(
     "message_sent",
     (event: any, ctx: any) => {
       try {
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
-        const channel = event?.channel || ctx?.channelId || "unknown";
-        const to = event?.to || event?.recipient || event?.metadata?.to || "unknown";
+        const sessionKey = resolveSessionKey(event, ctx);
+        const channel = resolveChannel(event, ctx);
+        const to = resolveRecipient(event, ctx);
         const success = event?.success !== false;
         const messageText = stringifyContent(event?.content) || stringifyContent(event?.message);
         const sessionCtx = sessionContextMap.get(sessionKey);
@@ -384,6 +536,14 @@ export function registerHooks(
 
         touchSession(sessionKey, parentContext);
         span.end();
+
+        // Current OpenClaw builds may not emit before_agent_start/agent_end consistently.
+        // If no agent span was established for this request, finalize the root span here
+        // so the backend receives a complete trace instead of waiting for stale cleanup.
+        if (sessionCtx && !sessionCtx.agentSpan) {
+          endRootSpan(sessionCtx, event?.error);
+          sessionContextMap.delete(sessionKey);
+        }
       } catch {
         // Never let telemetry errors break the main flow
       }
@@ -402,12 +562,16 @@ export function registerHooks(
     "before_agent_start",
     (event: any, ctx: any) => {
       try {
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
+        const sessionKey = resolveSessionKey(event, ctx);
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const model = event?.model || "unknown";
 
-        const sessionCtx = sessionContextMap.get(sessionKey);
-        const parentContext = sessionCtx?.rootContext || context.active();
+        const sessionCtx = getOrCreateSessionContext(tracer, sessionKey, logger);
+        const parentContext = sessionCtx.rootContext;
+
+        logger.debug?.(
+          `[otel] before_agent_start resolved session=${sessionKey}, agent=${agentId}, model=${model}`
+        );
 
         // Check for join from a previous parallel fork
         const joinInfo = consumeJoin(sessionKey);
@@ -465,21 +629,8 @@ export function registerHooks(
         const agentContext = trace.setSpan(parentContext, agentSpan);
 
         // Store agent span context for tool spans
-        if (sessionCtx) {
-          sessionCtx.agentSpan = agentSpan;
-          sessionCtx.agentContext = agentContext;
-        } else {
-          // No root span (e.g., heartbeat) — create a standalone context
-          sessionContextMap.set(sessionKey, {
-            rootSpan: agentSpan,
-            rootContext: agentContext,
-            agentSpan,
-            agentContext,
-            toolSpans: new Map<string, ToolSpanContext>(),
-            toolSpanSequence: 0,
-            startTime: Date.now(),
-          });
-        }
+        sessionCtx.agentSpan = agentSpan;
+        sessionCtx.agentContext = agentContext;
 
         // Register in activeAgentSpans for diagnostics integration
         activeAgentSpans.set(sessionKey, agentSpan);
@@ -509,7 +660,7 @@ export function registerHooks(
           return undefined;
         }
 
-        const sessionCtx = sessionContextMap.get(sessionKey) || ensureStandaloneSessionContext(tracer, sessionKey);
+        const sessionCtx = getOrCreateSessionContext(tracer, sessionKey, logger);
         const parentContext = getParentContext(sessionCtx);
 
         if (sessionCtx.llmSpan) {
@@ -645,7 +796,7 @@ export function registerHooks(
         const toolCallId = typeof event?.toolCallId === "string" ? event.toolCallId : undefined;
         const agentId = ctx?.agentId || event?.agentId || "unknown";
         const toolInput = event?.params || event?.input || {};
-        const sessionCtx = sessionContextMap.get(sessionKey) || ensureStandaloneSessionContext(tracer, sessionKey);
+        const sessionCtx = getOrCreateSessionContext(tracer, sessionKey, logger);
         const parentContext = getParentContext(sessionCtx);
 
         const span = tracer.startSpan(
@@ -764,7 +915,7 @@ export function registerHooks(
         const sessionKey = ctx?.sessionKey || "unknown";
         const agentId = ctx?.agentId || "unknown";
 
-        const sessionCtx = sessionContextMap.get(sessionKey);
+        const sessionCtx = getOrCreateSessionContext(tracer, sessionKey, logger);
         const matchedToolSpan = findToolSpanEntry({
           sessionCtx,
           sessionKey,
@@ -903,7 +1054,7 @@ export function registerHooks(
     "agent_end",
     async (event: any, ctx: any) => {
       try {
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
+        const sessionKey = resolveSessionKey(event, ctx);
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const durationMs = event?.durationMs;
         const success = event?.success !== false;
@@ -1072,18 +1223,12 @@ export function registerHooks(
           }
 
           agentSpan.end();
+          sessionCtx.agentEnded = true;
         }
 
         // End the root request span
         if (sessionCtx?.rootSpan && sessionCtx.rootSpan !== sessionCtx.agentSpan) {
-          const totalMs = Date.now() - sessionCtx.startTime;
-          sessionCtx.rootSpan.setAttribute("openclaw.request.duration_ms", totalMs);
-          if (errorMsg) {
-            sessionCtx.rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(errorMsg).slice(0, 200) });
-          } else {
-            sessionCtx.rootSpan.setStatus({ code: SpanStatusCode.OK });
-          }
-          sessionCtx.rootSpan.end();
+          endRootSpan(sessionCtx, errorMsg);
         }
 
         // Clean up all per-session state
