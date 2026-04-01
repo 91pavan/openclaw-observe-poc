@@ -5,7 +5,7 @@
  * Trace structure per request:
  *   openclaw.request (root span, covers full message → reply lifecycle)
  *   ├── openclaw.agent.turn (agent processing span)
- *   │   ├── tool.exec (tool call)
+ *   │   ├── tool.exec (tool call)          ← fork/join detected here
  *   │   ├── tool.Read (tool call)
  *   │   ├── anthropic.chat (auto-instrumented by OpenLLMetry)
  *   │   └── tool.write (tool call)
@@ -14,19 +14,33 @@
  * Context propagation:
  *   - message_received: creates root span, stores in sessionContextMap
  *   - before_agent_start: creates child "agent turn" span under root
+ *     + agent handoff tracking via span links
+ *     + join detection from previous parallel fork
  *   - tool_result_persist: creates child tool span under agent turn
+ *     + fork detection for parallel tool calls
  *   - agent_end: ends the agent turn span
+ *     + finalizes fork groups, annotates join metadata
  *
  * IMPORTANT: OpenClaw has TWO hook registration systems:
  *   - api.registerHook() → event-stream hooks (command:new, gateway:startup)
  *   - api.on()           → typed plugin hooks (tool_result_persist, agent_end)
  */
 
-import { SpanKind, SpanStatusCode, context, trace, type Span, type Context } from "@opentelemetry/api";
+import { SpanKind, SpanStatusCode, context, trace, type Span, type Context, type Link } from "@opentelemetry/api";
 import type { TelemetryRuntime } from "./telemetry.js";
 import type { OtelObservabilityConfig } from "./config.js";
 import { activeAgentSpans, getPendingUsage, enrichSpanWithUsage, hasDiagnosticsSupport } from "./diagnostics.js";
 import { checkToolSecurity, checkMessageSecurity, type SecurityCounters } from "./security.js";
+import { onAgentStart, onAgentEnd, cleanupHandoff, getHandoffSequence, setHandoffLogger } from "./handoff.js";
+import { registerToolSpan, finalizeAgentTurn, consumeJoin, cleanupForkJoin, setForkJoinLogger } from "./forkjoin.js";
+import {
+  ObserveSpanKind,
+  ATTR_OBSERVE_SPAN_KIND,
+  ATTR_OBSERVE_ENTITY_NAME,
+  ATTR_OBSERVE_ENTITY_INPUT,
+  ATTR_OBSERVE_ENTITY_OUTPUT,
+} from "./observe-attributes.js";
+import { touchSession, endSession } from "./session-lifecycle.js";
 
 /** Active trace context for a session — allows connecting spans into one trace. */
 interface SessionTraceContext {
@@ -50,7 +64,9 @@ export function registerHooks(
 ): void {
   const { tracer, counters, histograms } = telemetry;
   const logger = api.logger;
-
+  // Initialize loggers for sub-modules
+  setHandoffLogger(logger);
+  setForkJoinLogger(logger);
   // ═══════════════════════════════════════════════════════════════════
   // TYPED HOOKS — registered via api.on() into registry.typedHooks
   // ═══════════════════════════════════════════════════════════════════
@@ -80,6 +96,8 @@ export function registerHooks(
         const rootSpan = tracer.startSpan("openclaw.request", {
           kind: SpanKind.SERVER,
           attributes: {
+            [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.WORKFLOW,
+            [ATTR_OBSERVE_ENTITY_NAME]: "openclaw.request",
             "openclaw.message.channel": channel,
             "openclaw.session.key": sessionKey,
             "openclaw.message.direction": "inbound",
@@ -108,6 +126,14 @@ export function registerHooks(
           rootContext,
           startTime: Date.now(),
         });
+
+        // Track session activity for lifecycle management
+        touchSession(sessionKey, rootContext);
+
+        // Capture message content if configured
+        if (config.captureContent && messageText) {
+          rootSpan.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, String(messageText).slice(0, 4096));
+        }
 
         // Record message count metric
         counters.messagesReceived.add(1, {
@@ -138,19 +164,58 @@ export function registerHooks(
         const sessionCtx = sessionContextMap.get(sessionKey);
         const parentContext = sessionCtx?.rootContext || context.active();
 
+        // Check for join from a previous parallel fork
+        const joinInfo = consumeJoin(sessionKey);
+        const joinLinks: Link[] = joinInfo?.links ?? [];
+        if (joinInfo) {
+          logger.debug?.(
+            `[otel] Join detected for agent=${agentId}: forkId=${joinInfo.attributes["ioa_observe.join.fork_id"]}, ` +
+            `branches=${joinInfo.attributes["ioa_observe.join.branch_count"]}, links=${joinLinks.length}`
+          );
+        }
+
         // Create agent turn span as child of root span
         const agentSpan = tracer.startSpan(
           "openclaw.agent.turn",
           {
             kind: SpanKind.INTERNAL,
             attributes: {
+              [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.AGENT,
+              [ATTR_OBSERVE_ENTITY_NAME]: agentId,
               "openclaw.agent.id": agentId,
               "openclaw.session.key": sessionKey,
               "openclaw.agent.model": model,
             },
+            links: joinLinks,
           },
           parentContext
         );
+
+        // Annotate join metadata if this agent follows a fork
+        if (joinInfo) {
+          for (const [k, v] of Object.entries(joinInfo.attributes)) {
+            agentSpan.setAttribute(k, v);
+          }
+          agentSpan.addEvent("agent.join", {
+            "ioa_observe.join.fork_id": joinInfo.attributes["ioa_observe.join.fork_id"],
+            "ioa_observe.join.branch_count": joinInfo.attributes["ioa_observe.join.branch_count"],
+          });
+        }
+
+        // Agent handoff tracking — link back to previous agent
+        const handoff = onAgentStart(sessionKey, agentId, agentSpan);
+        for (const [k, v] of Object.entries(handoff.attributes)) {
+          agentSpan.setAttribute(k, v);
+        }
+        if (handoff.links.length > 0) {
+          logger.debug?.(
+            `[otel] Handoff links prepared for agent=${agentId}: ${handoff.links.length} link(s), ` +
+            `seq=${handoff.attributes["ioa_observe.agent.sequence"]}, ` +
+            `previous=${handoff.attributes["ioa_observe.agent.previous"] || "(none)"}`
+          );
+        }
+        // Note: span links cannot be added after creation in OTel JS,
+        // so handoff links will apply to the NEXT agent span via onAgentStart
 
         const agentContext = trace.setSpan(parentContext, agentSpan);
 
@@ -218,6 +283,8 @@ export function registerHooks(
           {
             kind: SpanKind.INTERNAL,
             attributes: {
+              [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.TOOL,
+              [ATTR_OBSERVE_ENTITY_NAME]: toolName,
               "openclaw.tool.name": toolName,
               "openclaw.tool.call_id": toolCallId,
               "openclaw.tool.is_synthetic": isSynthetic,
@@ -227,6 +294,28 @@ export function registerHooks(
           },
           parentContext
         );
+
+        // Track session activity
+        touchSession(sessionKey, parentContext);
+
+        // Fork detection — register this tool span for parallel detection
+        const agentSequence = getHandoffSequence(sessionKey);
+        const forkAttrs = registerToolSpan(sessionKey, toolName, span, agentId, agentSequence);
+        if (forkAttrs) {
+          for (const [k, v] of Object.entries(forkAttrs)) {
+            span.setAttribute(k, v);
+          }
+          logger.debug?.(
+            `[otel] Tool in fork group: tool=${toolName}, session=${sessionKey}, ` +
+            `forkId=${forkAttrs["ioa_observe.fork.id"]}, branch=${forkAttrs["ioa_observe.fork.branch_index"]}`
+          );
+        }
+
+        // Capture tool input if configured
+        if (config.captureContent && toolInput) {
+          const inputStr = typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput);
+          span.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, inputStr.slice(0, 4096));
+        }
 
         // ═══ SECURITY DETECTION 1 & 3: File Access & Dangerous Commands ═══
         const securityEvent = checkToolSecurity(
@@ -257,6 +346,11 @@ export function registerHooks(
             const totalChars = textParts.reduce((sum: number, t: string) => sum + t.length, 0);
             span.setAttribute("openclaw.tool.result_chars", totalChars);
             span.setAttribute("openclaw.tool.result_parts", contentArray.length);
+
+            // Capture tool output if configured
+            if (config.captureContent && textParts.length > 0) {
+              span.setAttribute(ATTR_OBSERVE_ENTITY_OUTPUT, textParts.join("").slice(0, 4096));
+            }
           }
 
           if (message?.is_error === true || message?.isError === true) {
@@ -406,6 +500,29 @@ export function registerHooks(
             });
           }
 
+          // Finalize fork/join detection for this agent turn
+          const forkResult = finalizeAgentTurn(sessionKey);
+          if (forkResult) {
+            agentSpan.setAttribute("ioa_observe.fork.id", forkResult.forkId);
+            agentSpan.setAttribute("ioa_observe.fork.branch_count", forkResult.branchCount);
+            agentSpan.addEvent("agent.fork_completed", {
+              "ioa_observe.fork.id": forkResult.forkId,
+              "ioa_observe.fork.branch_count": forkResult.branchCount,
+            });
+            logger.debug?.(
+              `[otel] Fork completed on agent turn: agent=${agentId}, session=${sessionKey}, ` +
+              `forkId=${forkResult.forkId}, branches=${forkResult.branchCount}`
+            );
+          }
+
+          // Update handoff state so next agent can link back
+          onAgentEnd(sessionKey, agentId, agentSpan);
+          logger.debug?.(
+            `[otel] Agent span ended: agent=${agentId}, session=${sessionKey}, ` +
+            `success=${success}, duration=${durationMs ?? "?"}ms, ` +
+            `tokens=${totalTokens}, cost=$${costUsd?.toFixed(4) ?? "?"}`
+          );
+
           if (errorMsg) {
             agentSpan.setAttribute("openclaw.agent.error", String(errorMsg).slice(0, 500));
             agentSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(errorMsg).slice(0, 200) });
@@ -424,9 +541,11 @@ export function registerHooks(
           sessionCtx.rootSpan.end();
         }
 
-        // Clean up
+        // Clean up all per-session state
         sessionContextMap.delete(sessionKey);
         activeAgentSpans.delete(sessionKey);
+        cleanupHandoff(sessionKey);
+        cleanupForkJoin(sessionKey);
 
         logger.debug?.(`[otel] Trace completed for session=${sessionKey}`);
       } catch {
@@ -472,6 +591,9 @@ export function registerHooks(
           counters.sessionResets.add(1, {
             "command.source": event?.context?.commandSource || "unknown",
           });
+          // End session lifecycle tracking on reset
+          endSession(sessionKey);
+          logger.debug?.(`[otel] Session ended via command:${action}: session=${sessionKey}`);
         }
 
         span.setStatus({ code: SpanStatusCode.OK });
@@ -527,6 +649,8 @@ export function registerHooks(
           if (ctx.rootSpan !== ctx.agentSpan) ctx.rootSpan?.end();
         } catch { /* ignore */ }
         sessionContextMap.delete(key);
+        cleanupHandoff(key);
+        cleanupForkJoin(key);
         logger.debug?.(`[otel] Cleaned up stale trace context for session=${key}`);
       }
     }
