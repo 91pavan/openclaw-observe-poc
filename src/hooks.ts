@@ -40,6 +40,57 @@ interface SessionTraceContext {
 /** Map of sessionKey → active trace context. Cleaned up on agent_end. */
 const sessionContextMap = new Map<string, SessionTraceContext>();
 
+function resolveInboundChannel(event: any, ctx: any): string {
+  return event?.channel || event?.channelId || ctx?.channelId || "unknown";
+}
+
+function resolveInboundSender(event: any): string {
+  return (
+    event?.from ||
+    event?.senderId ||
+    event?.metadata?.senderId ||
+    event?.metadata?.from ||
+    "unknown"
+  );
+}
+
+function resolveInboundMessageText(event: any): string {
+  const value =
+    event?.content || event?.text || event?.message || event?.body || event?.bodyForAgent || "";
+  return typeof value === "string" ? value : "";
+}
+
+function ensureRootSpan(params: {
+  tracer: TelemetryRuntime["tracer"];
+  sessionKey: string;
+  channel: string;
+  from: string;
+}): SessionTraceContext {
+  const existing = sessionContextMap.get(params.sessionKey);
+  if (existing) {
+    return existing;
+  }
+
+  const rootSpan = params.tracer.startSpan("openclaw.request", {
+    kind: SpanKind.SERVER,
+    attributes: {
+      "openclaw.message.channel": params.channel,
+      "openclaw.session.key": params.sessionKey,
+      "openclaw.message.direction": "inbound",
+      "openclaw.message.from": params.from,
+    },
+  });
+
+  const rootContext = trace.setSpan(context.active(), rootSpan);
+  const sessionTraceContext: SessionTraceContext = {
+    rootSpan,
+    rootContext,
+    startTime: Date.now(),
+  };
+  sessionContextMap.set(params.sessionKey, sessionTraceContext);
+  return sessionTraceContext;
+}
+
 /**
  * Register all plugin hooks on the OpenClaw plugin API.
  */
@@ -71,50 +122,40 @@ export function registerHooks(
     "message_received",
     async (event: any, ctx: any) => {
       try {
-        const channel = event?.channel || "unknown";
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
-        const from = event?.from || event?.senderId || "unknown";
-        const messageText = event?.text || event?.message || "";
+        const channel = resolveInboundChannel(event, ctx);
+        const sessionKey = event?.sessionKey || ctx?.sessionKey;
+        const from = resolveInboundSender(event);
+        const messageText = resolveInboundMessageText(event);
 
-        // Create root span for this request
-        const rootSpan = tracer.startSpan("openclaw.request", {
-          kind: SpanKind.SERVER,
-          attributes: {
-            "openclaw.message.channel": channel,
-            "openclaw.session.key": sessionKey,
-            "openclaw.message.direction": "inbound",
-            "openclaw.message.from": from,
-          },
-        });
+        // Newer OpenClaw builds do not expose sessionKey on message_received.
+        // Defer root-span creation until before_dispatch in that case.
+        const rootSpan = sessionKey
+          ? ensureRootSpan({ tracer, sessionKey, channel, from }).rootSpan
+          : undefined;
 
         // ═══ SECURITY DETECTION 2: Prompt Injection ═══════════════
-        if (messageText && typeof messageText === "string" && messageText.length > 0) {
+        if (rootSpan && messageText.length > 0) {
           const securityEvent = checkMessageSecurity(
             messageText,
             rootSpan,
             securityCounters,
-            sessionKey
+            sessionKey || "unknown"
           );
           if (securityEvent) {
             logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
           }
         }
 
-        // Store the context so child spans can reference it
-        const rootContext = trace.setSpan(context.active(), rootSpan);
-
-        sessionContextMap.set(sessionKey, {
-          rootSpan,
-          rootContext,
-          startTime: Date.now(),
-        });
-
         // Record message count metric
         counters.messagesReceived.add(1, {
           "openclaw.message.channel": channel,
         });
 
-        logger.debug?.(`[otel] Root span started for session=${sessionKey}`);
+        if (sessionKey) {
+          logger.debug?.(`[otel] Inbound message observed for session=${sessionKey}`);
+        } else {
+          logger.debug?.("[otel] Inbound message observed before session binding was available");
+        }
       } catch {
         // Never let telemetry errors break the main flow
       }
@@ -123,6 +164,52 @@ export function registerHooks(
   );
 
   logger.info("[otel] Registered message_received hook (via api.on)");
+
+  // ── before_dispatch ──────────────────────────────────────────────
+  // Creates the root span once routing/session metadata has been resolved.
+
+  api.on(
+    "before_dispatch",
+    (event: any, ctx: any) => {
+      try {
+        const sessionKey = event?.sessionKey || ctx?.sessionKey;
+        if (!sessionKey) {
+          return undefined;
+        }
+
+        const channel = resolveInboundChannel(event, ctx);
+        const from =
+          event?.senderId ||
+          ctx?.senderId ||
+          event?.from ||
+          "unknown";
+        const messageText = resolveInboundMessageText(event);
+        const hadSessionContext = sessionContextMap.has(sessionKey);
+        const sessionCtx = ensureRootSpan({ tracer, sessionKey, channel, from });
+
+        if (!hadSessionContext && messageText.length > 0) {
+          const securityEvent = checkMessageSecurity(
+            messageText,
+            sessionCtx.rootSpan,
+            securityCounters,
+            sessionKey
+          );
+          if (securityEvent) {
+            logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
+          }
+        }
+
+        logger.debug?.(`[otel] Root span ready for session=${sessionKey}`);
+      } catch {
+        // Never let telemetry errors break the main flow
+      }
+
+      return undefined;
+    },
+    { priority: 95 }
+  );
+
+  logger.info("[otel] Registered before_dispatch hook (via api.on)");
 
   // ── before_agent_start ───────────────────────────────────────────
   // Creates an "agent turn" child span under the root request span.
