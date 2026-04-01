@@ -113,7 +113,7 @@ export function touchSession(
       workflowName,
       ended: false,
     });
-    loggerRef?.debug?.(
+    loggerRef?.info?.(
       `[otel:session] New session tracked: session=${sessionKey}, activeSessions=${sessions.size}`
     );
   }
@@ -126,7 +126,7 @@ export function touchSession(
 export function endSession(sessionKey: string): void {
   const session = sessions.get(sessionKey);
   if (session && !session.ended) {
-    loggerRef?.debug?.(
+    loggerRef?.info?.(
       `[otel:session] Explicit session end: session=${sessionKey}`
     );
     emitSessionEnd(session);
@@ -161,7 +161,7 @@ function checkIdleSessions(): void {
     if (session.ended) continue;
     const idleMs = now - session.lastActivityAt;
     if (idleMs > idleTimeoutMs) {
-      loggerRef?.debug?.(
+      loggerRef?.info?.(
         `[otel:session] Session idle timeout: session=${key}, ` +
         `idleFor=${Math.round(idleMs / 1000)}s (threshold=${Math.round(idleTimeoutMs / 1000)}s)`
       );
@@ -211,7 +211,7 @@ function emitSessionEnd(session: SessionActivity): void {
 function emitAllSessionEnds(): void {
   const remaining = [...sessions.values()].filter(s => !s.ended);
   if (remaining.length > 0) {
-    loggerRef?.debug?.(
+    loggerRef?.info?.(
       `[otel:session] Process exit — emitting session.end for ${remaining.length} active session(s): ` +
       `[${remaining.map(s => s.sessionKey).join(", ")}]`
     );

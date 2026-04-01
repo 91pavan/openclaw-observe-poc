@@ -88,7 +88,7 @@ export function registerToolSpan(
       first.span.setAttribute("ioa_observe.fork.branch_index", 0);
       first.span.setAttribute("ioa_observe.fork.parent_name", agentName);
       first.span.setAttribute("ioa_observe.fork.parent_sequence", agentSequence);
-      loggerRef?.debug?.(
+      loggerRef?.info?.(
         `[otel:forkjoin] Fork group detected: session=${sessionKey}, forkId=${existing.forkId}, ` +
         `branch[0]=${first.toolName}, branch[1]=${toolName} (window=${now - existing.firstTimestamp}ms)`
       );
@@ -153,10 +153,12 @@ export function finalizeAgentTurn(
   // Store completed fork for potential join annotation on next agent
   completedForks.set(sessionKey, group);
 
-  loggerRef?.debug?.(
+  loggerRef?.info?.(
     `[otel:forkjoin] Fork group finalized: session=${sessionKey}, forkId=${group.forkId}, ` +
-    `branches=${group.tools.length} [${group.tools.map(t => t.toolName).join(", ")}], ` +
-    `awaiting join from next agent`
+    `branches=${group.tools.length} [${group.tools.map(t => t.toolName).join(", ")}]`
+  );
+  loggerRef?.debug?.(
+    `[otel:forkjoin]   awaiting join from next agent`
   );
 
   return {
@@ -185,7 +187,7 @@ export function consumeJoin(
 
   completedForks.delete(sessionKey);
 
-  loggerRef?.debug?.(
+  loggerRef?.info?.(
     `[otel:forkjoin] Join consumed: session=${sessionKey}, forkId=${group.forkId}, ` +
     `joining ${group.tools.length} branches [${group.tools.map(t => t.toolName).join(", ")}]`
   );

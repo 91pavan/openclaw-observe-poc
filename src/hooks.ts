@@ -140,7 +140,7 @@ export function registerHooks(
           "openclaw.message.channel": channel,
         });
 
-        logger.debug?.(`[otel] Root span started for session=${sessionKey}`);
+        logger.info?.(`[otel] Root span started for session=${sessionKey}, channel=${channel}`);
       } catch {
         // Never let telemetry errors break the main flow
       }
@@ -168,9 +168,9 @@ export function registerHooks(
         const joinInfo = consumeJoin(sessionKey);
         const joinLinks: Link[] = joinInfo?.links ?? [];
         if (joinInfo) {
-          logger.debug?.(
+          logger.info?.(
             `[otel] Join detected for agent=${agentId}: forkId=${joinInfo.attributes["ioa_observe.join.fork_id"]}, ` +
-            `branches=${joinInfo.attributes["ioa_observe.join.branch_count"]}, links=${joinLinks.length}`
+            `branches=${joinInfo.attributes["ioa_observe.join.branch_count"]}`
           );
         }
 
@@ -237,7 +237,7 @@ export function registerHooks(
         // Register in activeAgentSpans for diagnostics integration
         activeAgentSpans.set(sessionKey, agentSpan);
 
-        logger.debug?.(`[otel] Agent turn span started: agent=${agentId}, session=${sessionKey}`);
+        logger.info?.(`[otel] Agent turn started: agent=${agentId}, model=${model}, session=${sessionKey}`);
       } catch {
         // Silently ignore
       }
@@ -305,9 +305,9 @@ export function registerHooks(
           for (const [k, v] of Object.entries(forkAttrs)) {
             span.setAttribute(k, v);
           }
-          logger.debug?.(
-            `[otel] Tool in fork group: tool=${toolName}, session=${sessionKey}, ` +
-            `forkId=${forkAttrs["ioa_observe.fork.id"]}, branch=${forkAttrs["ioa_observe.fork.branch_index"]}`
+          logger.info?.(
+            `[otel] Tool in fork group: tool=${toolName}, forkId=${forkAttrs["ioa_observe.fork.id"]}, ` +
+            `branch=${forkAttrs["ioa_observe.fork.branch_index"]}`
           );
         }
 
@@ -509,16 +509,15 @@ export function registerHooks(
               "ioa_observe.fork.id": forkResult.forkId,
               "ioa_observe.fork.branch_count": forkResult.branchCount,
             });
-            logger.debug?.(
-              `[otel] Fork completed on agent turn: agent=${agentId}, session=${sessionKey}, ` +
-              `forkId=${forkResult.forkId}, branches=${forkResult.branchCount}`
+            logger.info?.(
+              `[otel] Fork completed: agent=${agentId}, forkId=${forkResult.forkId}, branches=${forkResult.branchCount}`
             );
           }
 
           // Update handoff state so next agent can link back
           onAgentEnd(sessionKey, agentId, agentSpan);
-          logger.debug?.(
-            `[otel] Agent span ended: agent=${agentId}, session=${sessionKey}, ` +
+          logger.info?.(
+            `[otel] Agent turn ended: agent=${agentId}, session=${sessionKey}, ` +
             `success=${success}, duration=${durationMs ?? "?"}ms, ` +
             `tokens=${totalTokens}, cost=$${costUsd?.toFixed(4) ?? "?"}`
           );
@@ -547,7 +546,7 @@ export function registerHooks(
         cleanupHandoff(sessionKey);
         cleanupForkJoin(sessionKey);
 
-        logger.debug?.(`[otel] Trace completed for session=${sessionKey}`);
+        logger.info?.(`[otel] Trace completed for session=${sessionKey}`);
       } catch {
         // Silently ignore
       }
@@ -593,7 +592,7 @@ export function registerHooks(
           });
           // End session lifecycle tracking on reset
           endSession(sessionKey);
-          logger.debug?.(`[otel] Session ended via command:${action}: session=${sessionKey}`);
+          logger.info?.(`[otel] Session ended via command:${action}: session=${sessionKey}`);
         }
 
         span.setStatus({ code: SpanStatusCode.OK });

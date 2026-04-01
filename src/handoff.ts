@@ -73,10 +73,12 @@ export function onAgentStart(
       sequence,
     });
 
-    loggerRef?.debug?.(
+    loggerRef?.info?.(
       `[otel:handoff] Agent handoff detected: session=${sessionKey}, ` +
-      `previous=${state.lastAgentName} (seq=${state.sequence}) → current=${agentId} (seq=${sequence}), ` +
-      `spanLink=traceId:${state.lastAgentSpanContext.traceId}/spanId:${state.lastAgentSpanContext.spanId}`
+      `previous=${state.lastAgentName} (seq=${state.sequence}) → current=${agentId} (seq=${sequence})`
+    );
+    loggerRef?.debug?.(
+      `[otel:handoff]   spanLink=traceId:${state.lastAgentSpanContext.traceId}/spanId:${state.lastAgentSpanContext.spanId}`
     );
   } else {
     // First agent in this session
@@ -88,7 +90,7 @@ export function onAgentStart(
       sequence: 1,
     });
 
-    loggerRef?.debug?.(
+    loggerRef?.info?.(
       `[otel:handoff] First agent in chain: session=${sessionKey}, agent=${agentId}, seq=1`
     );
   }
