@@ -11,22 +11,29 @@ For **deeper observability**, install the custom plugin from this repo. It uses 
 ```
 openclaw.request (root span)
 ├── openclaw.agent.turn
+│   ├── llm.claude-sonnet-4
 │   ├── tool.Read (file read)
 │   ├── tool.exec (shell command)  
 │   ├── tool.Write (file write)
 │   └── tool.web_search
-└── (child spans connected via trace context)
+└── openclaw.message.sent
 ```
 
 **Per-Tool Visibility:**
 - Individual spans for each tool call
-- Tool execution time
-- Result size (characters)
+- Explicit tool start/end lifecycle hooks when OpenClaw exposes them
+- Tool execution time and result size
 - Error tracking per tool
+
+**Per-LLM Visibility:**
+- Explicit `llm_input` and `llm_output` spans when available
+- Token usage and model/provider attributes on both LLM and agent spans
+- Fallback token extraction from `agent_end` messages when diagnostics are unavailable
 
 **Request Lifecycle:**
 - Full message → response tracing
 - Session context propagation
+- Outbound `message_sent` tracing for delivery visibility
 - Agent turn duration with token breakdown
 
 ### Installation
