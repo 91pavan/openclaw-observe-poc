@@ -49,10 +49,146 @@ interface SessionTraceContext {
   agentSpan?: Span;
   agentContext?: Context;
   startTime: number;
+  aliases: Set<string>;
 }
 
 /** Map of sessionKey → active trace context. Cleaned up on agent_end. */
 const sessionContextMap = new Map<string, SessionTraceContext>();
+
+function pushCandidate(target: string[], value: unknown): void {
+  if (typeof value !== "string") return;
+  const trimmed = value.trim();
+  if (!trimmed || target.includes(trimmed)) return;
+  target.push(trimmed);
+}
+
+function collectSessionKeys(event?: any, ctx?: any): string[] {
+  const keys: string[] = [];
+  const metadata = event?.metadata;
+
+  pushCandidate(keys, event?.sessionKey);
+  pushCandidate(keys, ctx?.sessionKey);
+  pushCandidate(keys, event?.conversationId);
+  pushCandidate(keys, ctx?.conversationId);
+  pushCandidate(keys, metadata?.sessionKey);
+  pushCandidate(keys, metadata?.conversationId);
+
+  return keys;
+}
+
+function bindSessionAliases(sessionCtx: SessionTraceContext, keys: string[]): void {
+  for (const key of keys) {
+    sessionCtx.aliases.add(key);
+    sessionContextMap.set(key, sessionCtx);
+  }
+}
+
+function getSessionTraceContext(event?: any, ctx?: any): SessionTraceContext | undefined {
+  const keys = collectSessionKeys(event, ctx);
+  for (const key of keys) {
+    const sessionCtx = sessionContextMap.get(key);
+    if (sessionCtx) {
+      bindSessionAliases(sessionCtx, keys);
+      return sessionCtx;
+    }
+  }
+  return undefined;
+}
+
+function cleanupSessionTraceContext(sessionCtx?: SessionTraceContext): void {
+  if (!sessionCtx) return;
+  for (const key of sessionCtx.aliases) {
+    sessionContextMap.delete(key);
+  }
+  sessionCtx.aliases.clear();
+}
+
+function extractMessageText(event: any): string {
+  if (typeof event?.text === "string") return event.text;
+  if (typeof event?.message === "string") return event.message;
+  if (typeof event?.content === "string") return event.content;
+
+  if (Array.isArray(event?.content)) {
+    return event.content
+      .map((part: any) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return "";
+}
+
+function startRootSpan(
+  tracer: TelemetryRuntime["tracer"],
+  event: any,
+  ctx: any,
+  config: OtelObservabilityConfig,
+  logger: any,
+  securityCounters: SecurityCounters,
+  counters: TelemetryRuntime["counters"]
+): SessionTraceContext | undefined {
+  const sessionKeys = collectSessionKeys(event, ctx);
+  const primarySessionKey = sessionKeys[0];
+
+  if (!primarySessionKey) {
+    logger.debug?.("[otel] Skipping eager request span start because no stable session/conversation key is available yet");
+    return undefined;
+  }
+
+  const channel = event?.channel || ctx?.channelId || event?.metadata?.channelId || "unknown";
+  const from = event?.from || event?.senderId || "unknown";
+  const messageText = extractMessageText(event);
+
+  const rootSpan = tracer.startSpan("openclaw.request", {
+    kind: SpanKind.SERVER,
+    attributes: {
+      [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.WORKFLOW,
+      [ATTR_OBSERVE_ENTITY_NAME]: "openclaw.request",
+      "openclaw.message.channel": channel,
+      "openclaw.session.key": primarySessionKey,
+      "openclaw.message.direction": "inbound",
+      "openclaw.message.from": from,
+    },
+  });
+
+  if (messageText.length > 0) {
+    const securityEvent = checkMessageSecurity(
+      messageText,
+      rootSpan,
+      securityCounters,
+      primarySessionKey
+    );
+    if (securityEvent) {
+      logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
+    }
+  }
+
+  const rootContext = trace.setSpan(context.active(), rootSpan);
+  const sessionCtx: SessionTraceContext = {
+    rootSpan,
+    rootContext,
+    startTime: Date.now(),
+    aliases: new Set<string>(),
+  };
+
+  bindSessionAliases(sessionCtx, sessionKeys);
+  touchSession(primarySessionKey, rootContext);
+
+  if (config.captureContent && messageText) {
+    rootSpan.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, String(messageText).slice(0, 4096));
+  }
+
+  counters.messagesReceived.add(1, {
+    "openclaw.message.channel": channel,
+  });
+
+  logger.info?.(`[otel] Root span started for session=${primarySessionKey}, aliases=${sessionKeys.join(",")}, channel=${channel}`);
+  return sessionCtx;
+}
 
 /**
  * Register all plugin hooks on the OpenClaw plugin API.
@@ -87,61 +223,24 @@ export function registerHooks(
     "message_received",
     async (event: any, ctx: any) => {
       try {
-        const channel = event?.channel || "unknown";
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
-        const from = event?.from || event?.senderId || "unknown";
-        const messageText = event?.text || event?.message || "";
-
-        // Create root span for this request
-        const rootSpan = tracer.startSpan("openclaw.request", {
-          kind: SpanKind.SERVER,
-          attributes: {
-            [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.WORKFLOW,
-            [ATTR_OBSERVE_ENTITY_NAME]: "openclaw.request",
-            "openclaw.message.channel": channel,
-            "openclaw.session.key": sessionKey,
-            "openclaw.message.direction": "inbound",
-            "openclaw.message.from": from,
-          },
-        });
-
-        // ═══ SECURITY DETECTION 2: Prompt Injection ═══════════════
-        if (messageText && typeof messageText === "string" && messageText.length > 0) {
-          const securityEvent = checkMessageSecurity(
-            messageText,
-            rootSpan,
-            securityCounters,
-            sessionKey
-          );
-          if (securityEvent) {
-            logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
+        const sessionCtx = getSessionTraceContext(event, ctx);
+        if (sessionCtx) {
+          const sessionKeys = collectSessionKeys(event, ctx);
+          bindSessionAliases(sessionCtx, sessionKeys);
+          const primarySessionKey = sessionKeys[0];
+          if (primarySessionKey) {
+            touchSession(primarySessionKey, sessionCtx.rootContext);
           }
+
+          const messageText = extractMessageText(event);
+          if (config.captureContent && messageText) {
+            sessionCtx.rootSpan.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, messageText.slice(0, 4096));
+          }
+        } else {
+          startRootSpan(tracer, event, ctx, config, logger, securityCounters, counters);
         }
-
-        // Store the context so child spans can reference it
-        const rootContext = trace.setSpan(context.active(), rootSpan);
-
-        sessionContextMap.set(sessionKey, {
-          rootSpan,
-          rootContext,
-          startTime: Date.now(),
-        });
-
-        // Track session activity for lifecycle management
-        touchSession(sessionKey, rootContext);
-
-        // Capture message content if configured
-        if (config.captureContent && messageText) {
-          rootSpan.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, String(messageText).slice(0, 4096));
-        }
-
-        // Record message count metric
-        counters.messagesReceived.add(1, {
-          "openclaw.message.channel": channel,
-        });
-
-        logger.info?.(`[otel] Root span started for session=${sessionKey}, channel=${channel}`);
-      } catch {
+      } catch (error) {
+        logger.debug?.(`[otel] message_received hook failed: ${String(error)}`);
         // Never let telemetry errors break the main flow
       }
     },
@@ -157,11 +256,15 @@ export function registerHooks(
     "before_agent_start",
     (event: any, ctx: any) => {
       try {
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
+        const sessionKeys = collectSessionKeys(event, ctx);
+        const sessionKey = sessionKeys[0] || "unknown";
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const model = event?.model || "unknown";
 
-        const sessionCtx = sessionContextMap.get(sessionKey);
+        let sessionCtx = getSessionTraceContext(event, ctx);
+        if (!sessionCtx) {
+          sessionCtx = startRootSpan(tracer, event, ctx, config, logger, securityCounters, counters);
+        }
         const parentContext = sessionCtx?.rootContext || context.active();
 
         // Check for join from a previous parallel fork
@@ -221,24 +324,28 @@ export function registerHooks(
 
         // Store agent span context for tool spans
         if (sessionCtx) {
+          bindSessionAliases(sessionCtx, sessionKeys);
           sessionCtx.agentSpan = agentSpan;
           sessionCtx.agentContext = agentContext;
         } else {
           // No root span (e.g., heartbeat) — create a standalone context
-          sessionContextMap.set(sessionKey, {
+          const fallbackContext: SessionTraceContext = {
             rootSpan: agentSpan,
             rootContext: agentContext,
             agentSpan,
             agentContext,
             startTime: Date.now(),
-          });
+            aliases: new Set<string>(),
+          };
+          bindSessionAliases(fallbackContext, sessionKeys.length > 0 ? sessionKeys : [sessionKey]);
         }
 
         // Register in activeAgentSpans for diagnostics integration
         activeAgentSpans.set(sessionKey, agentSpan);
 
         logger.info?.(`[otel] Agent turn started: agent=${agentId}, model=${model}, session=${sessionKey}`);
-      } catch {
+      } catch (error) {
+        logger.debug?.(`[otel] before_agent_start hook failed: ${String(error)}`);
         // Silently ignore
       }
 
@@ -388,7 +495,8 @@ export function registerHooks(
     "agent_end",
     async (event: any, ctx: any) => {
       try {
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
+        const sessionKeys = collectSessionKeys(event, ctx);
+        const sessionKey = sessionKeys[0] || "unknown";
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const durationMs = event?.durationMs;
         const success = event?.success !== false;
@@ -441,7 +549,7 @@ export function registerHooks(
         const totalTokens = totalInputTokens + totalOutputTokens + cacheReadTokens + cacheWriteTokens;
         logger.debug?.(`[otel] agent_end tokens: input=${totalInputTokens}, output=${totalOutputTokens}, cache_read=${cacheReadTokens}, cache_write=${cacheWriteTokens}, model=${model}`);
 
-        const sessionCtx = sessionContextMap.get(sessionKey);
+        const sessionCtx = getSessionTraceContext(event, ctx);
 
         // End the agent turn span
         if (sessionCtx?.agentSpan) {
@@ -541,13 +649,14 @@ export function registerHooks(
         }
 
         // Clean up all per-session state
-        sessionContextMap.delete(sessionKey);
+        cleanupSessionTraceContext(sessionCtx);
         activeAgentSpans.delete(sessionKey);
         cleanupHandoff(sessionKey);
         cleanupForkJoin(sessionKey);
 
         logger.info?.(`[otel] Trace completed for session=${sessionKey}`);
-      } catch {
+      } catch (error) {
+        logger.debug?.(`[otel] agent_end hook failed: ${String(error)}`);
         // Silently ignore
       }
     },
@@ -641,16 +750,17 @@ export function registerHooks(
   setInterval(() => {
     const now = Date.now();
     const maxAge = 5 * 60 * 1000; // 5 minutes
-    for (const [key, ctx] of sessionContextMap) {
+    for (const ctx of new Set(sessionContextMap.values())) {
       if (now - ctx.startTime > maxAge) {
+        const staleKey = [...ctx.aliases][0] || "unknown";
         try {
           ctx.agentSpan?.end();
           if (ctx.rootSpan !== ctx.agentSpan) ctx.rootSpan?.end();
         } catch { /* ignore */ }
-        sessionContextMap.delete(key);
-        cleanupHandoff(key);
-        cleanupForkJoin(key);
-        logger.debug?.(`[otel] Cleaned up stale trace context for session=${key}`);
+        cleanupSessionTraceContext(ctx);
+        cleanupHandoff(staleKey);
+        cleanupForkJoin(staleKey);
+        logger.debug?.(`[otel] Cleaned up stale trace context for session=${staleKey}`);
       }
     }
   }, 60_000);
