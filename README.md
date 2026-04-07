@@ -35,6 +35,7 @@ openclaw.request (root span)
 - Session context propagation
 - Outbound `message_sent` tracing for delivery visibility
 - Agent turn duration with token breakdown
+- Fallback `openclaw.request` root span creation during `before_agent_start` when inbound hooks only expose conversation metadata
 
 ### Installation
 
@@ -98,20 +99,13 @@ This preload runs before OpenClaw imports the provider SDKs, which is required f
 - Amazon Bedrock
 - Google Vertex AI
 
-### Gemini Note
-
-There is no separate Traceloop package for the standalone Gemini JavaScript SDK at the moment.
-If you are accessing Gemini through Vertex AI, the Vertex AI instrumentation path applies.
-If you are using the standalone Google GenAI SDK directly, this repo does not currently auto-instrument
-that SDK.
-
-4. Verify startup logs:
+1. Verify startup logs:
   ```text
   [otel-preload] GenAI instrumentation active (providers=anthropic,bedrock,openai,vertexai, ...)
   [otel] ✅ GenAI instrumentation active via NODE_OPTIONS preload
   ```
 
-### Why Preload Is Required
+### Preload the instrumentation
 
 The plugin itself runs in a different module-loading context from the provider SDKs.
 Patching provider SDKs from inside the plugin is too late and does not affect the
