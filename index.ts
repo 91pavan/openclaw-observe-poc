@@ -32,9 +32,18 @@
 import { parseConfig, type OtelObservabilityConfig } from "./src/config.js";
 import { initTelemetry, type TelemetryRuntime } from "./src/telemetry.js";
 import { initOpenLLMetry } from "./src/openllmetry.js";
-import { registerHooks } from "./src/hooks.js";
+import * as hooksModule from "./src/hooks.js";
 import { registerDiagnosticsListener, hasDiagnosticsSupport } from "./src/diagnostics.js";
 import { startSessionWatcher, stopSessionWatcher } from "./src/session-lifecycle.js";
+
+const registerHooks =
+  typeof hooksModule.registerHooks === "function"
+    ? hooksModule.registerHooks
+    : typeof hooksModule.default === "function"
+      ? hooksModule.default
+      : typeof (hooksModule.default as any)?.registerHooks === "function"
+        ? (hooksModule.default as any).registerHooks
+        : undefined;
 
 const otelObservabilityPlugin = {
   id: "otel-observe-poc",
@@ -122,6 +131,9 @@ const otelObservabilityPlugin = {
         }
 
         // 3. Register hooks for tool results and command events
+        if (typeof registerHooks !== "function") {
+          throw new TypeError("hooks module did not provide a callable registerHooks export");
+        }
         registerHooks(api, telemetry, config);
 
         // 4. Start session lifecycle watcher (auto session.end detection)
