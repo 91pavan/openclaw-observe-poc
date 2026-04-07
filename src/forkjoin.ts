@@ -88,12 +88,12 @@ export function registerToolSpan(
       first.span.setAttribute("ioa_observe.fork.branch_index", 0);
       first.span.setAttribute("ioa_observe.fork.parent_name", agentName);
       first.span.setAttribute("ioa_observe.fork.parent_sequence", agentSequence);
-      loggerRef?.info?.(
+      loggerRef?.info && loggerRef.info(
         `[otel:forkjoin] Fork group detected: session=${sessionKey}, forkId=${existing.forkId}, ` +
         `branch[0]=${first.toolName}, branch[1]=${toolName} (window=${now - existing.firstTimestamp}ms)`
       );
     } else {
-      loggerRef?.debug?.(
+      loggerRef?.debug && loggerRef.debug(
         `[otel:forkjoin] Fork branch added: session=${sessionKey}, forkId=${existing.forkId}, ` +
         `branch[${branchIndex}]=${toolName}, total=${existing.tools.length}`
       );
@@ -122,7 +122,7 @@ export function registerToolSpan(
     firstTimestamp: now,
   });
 
-  loggerRef?.debug?.(
+  loggerRef?.debug && loggerRef.debug(
     `[otel:forkjoin] New tool registered (potential fork): session=${sessionKey}, ` +
     `tool=${toolName}, candidateForkId=${forkId}`
   );
@@ -143,7 +143,7 @@ export function finalizeAgentTurn(
   pendingTools.delete(sessionKey);
 
   if (!group || group.tools.length < 2) {
-    loggerRef?.debug?.(
+    loggerRef?.debug && loggerRef.debug(
       `[otel:forkjoin] Agent turn finalized: session=${sessionKey}, ` +
       `tools=${group?.tools.length ?? 0} (no fork — need ≥2 concurrent tools)`
     );
@@ -153,11 +153,11 @@ export function finalizeAgentTurn(
   // Store completed fork for potential join annotation on next agent
   completedForks.set(sessionKey, group);
 
-  loggerRef?.info?.(
+  loggerRef?.info && loggerRef.info(
     `[otel:forkjoin] Fork group finalized: session=${sessionKey}, forkId=${group.forkId}, ` +
     `branches=${group.tools.length} [${group.tools.map(t => t.toolName).join(", ")}]`
   );
-  loggerRef?.debug?.(
+  loggerRef?.debug && loggerRef.debug(
     `[otel:forkjoin]   awaiting join from next agent`
   );
 
@@ -187,7 +187,7 @@ export function consumeJoin(
 
   completedForks.delete(sessionKey);
 
-  loggerRef?.info?.(
+  loggerRef?.info && loggerRef.info(
     `[otel:forkjoin] Join consumed: session=${sessionKey}, forkId=${group.forkId}, ` +
     `joining ${group.tools.length} branches [${group.tools.map(t => t.toolName).join(", ")}]`
   );
@@ -216,7 +216,7 @@ export function cleanupForkJoin(sessionKey: string): void {
   pendingTools.delete(sessionKey);
   completedForks.delete(sessionKey);
   if (hadPending || hadCompleted) {
-    loggerRef?.debug?.(
+    loggerRef?.debug && loggerRef.debug(
       `[otel:forkjoin] Cleaned up fork/join state: session=${sessionKey}, ` +
       `hadPending=${hadPending}, hadCompleted=${hadCompleted}`
     );

@@ -37,15 +37,26 @@ interface HandoffState {
 /** Map of sessionKey → handoff state for tracking agent chains */
 const handoffMap = new Map<string, HandoffState>();
 
+export interface HandoffSeed {
+  lastAgentSpanContext: SpanContext;
+  lastAgentName: string;
+  sequence: number;
+}
+
+export interface AgentHandoffStart {
+  links: Link[];
+  attributes: Record<string, string | number>;
+  sequence: number;
+  previousAgentName?: string;
+}
+
 /**
- * Called when a new agent span starts. Returns span links and attributes
- * to annotate the agent span with handoff metadata.
+ * Prepare handoff links and attributes before creating the next agent span.
  */
 export function onAgentStart(
   sessionKey: string,
-  agentId: string,
-  agentSpan: Span
-): { links: Link[]; attributes: Record<string, string | number> } {
+  agentId: string
+): AgentHandoffStart {
   const state = handoffMap.get(sessionKey);
   const links: Link[] = [];
   const attributes: Record<string, string | number> = {};
@@ -65,37 +76,77 @@ export function onAgentStart(
 
     attributes["ioa_observe.agent.sequence"] = sequence;
     attributes["ioa_observe.agent.previous"] = state.lastAgentName;
-
-    // Update state for next agent in chain
-    handoffMap.set(sessionKey, {
-      lastAgentSpanContext: agentSpan.spanContext(),
-      lastAgentName: agentId,
-      sequence,
-    });
-
-    loggerRef?.info?.(
-      `[otel:handoff] Agent handoff detected: session=${sessionKey}, ` +
-      `previous=${state.lastAgentName} (seq=${state.sequence}) → current=${agentId} (seq=${sequence})`
-    );
-    loggerRef?.debug?.(
+    loggerRef?.debug && loggerRef.debug(
       `[otel:handoff]   spanLink=traceId:${state.lastAgentSpanContext.traceId}/spanId:${state.lastAgentSpanContext.spanId}`
     );
+
+    return {
+      links,
+      attributes,
+      sequence,
+      previousAgentName: state.lastAgentName,
+    };
   } else {
     // First agent in this session
     attributes["ioa_observe.agent.sequence"] = 1;
 
-    handoffMap.set(sessionKey, {
-      lastAgentSpanContext: agentSpan.spanContext(),
-      lastAgentName: agentId,
+    return {
+      links,
+      attributes,
       sequence: 1,
-    });
+    };
+  }
+}
 
-    loggerRef?.info?.(
-      `[otel:handoff] First agent in chain: session=${sessionKey}, agent=${agentId}, seq=1`
-    );
+/**
+ * Seed handoff state for a new session using a span context from another session.
+ * This lets subagent sessions link back to the spawning agent on their first turn.
+ */
+export function seedHandoffState(sessionKey: string, seed: HandoffSeed): boolean {
+  if (handoffMap.has(sessionKey)) {
+    return false;
   }
 
-  return { links, attributes };
+  handoffMap.set(sessionKey, {
+    lastAgentSpanContext: seed.lastAgentSpanContext,
+    lastAgentName: seed.lastAgentName,
+    sequence: seed.sequence,
+  });
+
+  loggerRef?.debug && loggerRef.debug(
+    `[otel:handoff] Seeded handoff state: session=${sessionKey}, ` +
+    `previous=${seed.lastAgentName}, seq=${seed.sequence}, spanId=${seed.lastAgentSpanContext.spanId}`
+  );
+
+  return true;
+}
+
+/**
+ * Register the newly created agent span as the active handoff state.
+ */
+export function registerAgentSpan(
+  sessionKey: string,
+  agentId: string,
+  agentSpan: Span,
+  sequence: number,
+  previousAgentName?: string
+): void {
+  handoffMap.set(sessionKey, {
+    lastAgentSpanContext: agentSpan.spanContext(),
+    lastAgentName: agentId,
+    sequence,
+  });
+
+  if (previousAgentName) {
+    loggerRef?.info && loggerRef.info(
+      `[otel:handoff] Agent handoff detected: session=${sessionKey}, ` +
+      `previous=${previousAgentName} (seq=${sequence - 1}) → current=${agentId} (seq=${sequence})`
+    );
+  } else {
+    loggerRef?.info && loggerRef.info(
+      `[otel:handoff] First agent in chain: session=${sessionKey}, agent=${agentId}, seq=${sequence}`
+    );
+  }
 }
 
 /**
@@ -107,7 +158,7 @@ export function onAgentEnd(sessionKey: string, agentId: string, agentSpan: Span)
   if (state) {
     state.lastAgentSpanContext = agentSpan.spanContext();
     state.lastAgentName = agentId;
-    loggerRef?.debug?.(
+    loggerRef?.debug && loggerRef.debug(
       `[otel:handoff] Agent ended, updated handoff state: session=${sessionKey}, ` +
       `agent=${agentId}, seq=${state.sequence}, spanId=${agentSpan.spanContext().spanId}`
     );
@@ -122,7 +173,7 @@ export function cleanupHandoff(sessionKey: string): void {
   const had = handoffMap.has(sessionKey);
   handoffMap.delete(sessionKey);
   if (had) {
-    loggerRef?.debug?.(`[otel:handoff] Cleaned up handoff state for session=${sessionKey}`);
+    loggerRef?.debug && loggerRef.debug(`[otel:handoff] Cleaned up handoff state for session=${sessionKey}`);
   }
 }
 

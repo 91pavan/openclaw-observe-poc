@@ -1,15 +1,15 @@
 /**
- * OpenClaw event hooks — captures tool executions, agent turns, messages,
+ * OpenClaw event hooks - captures tool executions, agent turns, messages,
  * and gateway lifecycle as connected OTel traces.
  *
  * Trace structure per request:
- *   openclaw.request (root span, covers full message → reply lifecycle)
- *   ├── openclaw.agent.turn (agent processing span)
- *   │   ├── tool.exec (tool call)          ← fork/join detected here
- *   │   ├── tool.Read (tool call)
- *   │   ├── anthropic.chat (auto-instrumented by OpenLLMetry)
- *   │   └── tool.write (tool call)
- *   └── (future: message.sent span)
+ *   openclaw.request (root span, covers full message -> reply lifecycle)
+ *   |- openclaw.agent.turn (agent processing span)
+ *   |  |- tool.exec (tool call)          <- fork/join detected here
+ *   |  |- tool.Read (tool call)
+ *   |  |- anthropic.chat (auto-instrumented by OpenLLMetry)
+ *   |  `- tool.write (tool call)
+ *   `- (future: message.sent span)
  *
  * Context propagation:
  *   - message_received: creates root span, stores in sessionContextMap
@@ -22,16 +22,16 @@
  *     + finalizes fork groups, annotates join metadata
  *
  * IMPORTANT: OpenClaw has TWO hook registration systems:
- *   - api.registerHook() → event-stream hooks (command:new, gateway:startup)
- *   - api.on()           → typed plugin hooks (tool_result_persist, agent_end)
+ *   - api.registerHook() -> event-stream hooks (command:new, gateway:startup)
+ *   - api.on()           -> typed plugin hooks (tool_result_persist, agent_end)
  */
 
-import { SpanKind, SpanStatusCode, context, trace, type Span, type Context, type Link } from "@opentelemetry/api";
+import { SpanKind, SpanStatusCode, context, trace, type Span, type SpanContext, type Context, type Link } from "@opentelemetry/api";
 import type { TelemetryRuntime } from "./telemetry.js";
 import type { OtelObservabilityConfig } from "./config.js";
-import { activeAgentSpans, getPendingUsage, enrichSpanWithUsage, hasDiagnosticsSupport } from "./diagnostics.js";
+import { activeAgentSpans, getPendingUsage } from "./diagnostics.js";
 import { checkToolSecurity, checkMessageSecurity, type SecurityCounters } from "./security.js";
-import { onAgentStart, onAgentEnd, cleanupHandoff, getHandoffSequence, setHandoffLogger } from "./handoff.js";
+import { onAgentStart, onAgentEnd, cleanupHandoff, getHandoffSequence, registerAgentSpan, seedHandoffState, setHandoffLogger } from "./handoff.js";
 import { registerToolSpan, finalizeAgentTurn, consumeJoin, cleanupForkJoin, setForkJoinLogger } from "./forkjoin.js";
 import {
   ObserveSpanKind,
@@ -42,18 +42,36 @@ import {
 } from "./observe-attributes.js";
 import { touchSession, endSession } from "./session-lifecycle.js";
 
-/** Active trace context for a session — allows connecting spans into one trace. */
+/** Active trace context for a session - allows connecting spans into one trace. */
 interface SessionTraceContext {
   rootSpan: Span;
   rootContext: Context;
   agentSpan?: Span;
   agentContext?: Context;
   startTime: number;
-  aliases: Set<string>;
 }
 
-/** Map of sessionKey → active trace context. Cleaned up on agent_end. */
+interface PendingSpawnHandoff {
+  targetAgentId: string;
+  sourceSessionKey: string;
+  sourceAgentId: string;
+  sourceAgentSequence: number;
+  sourceAgentSpanContext?: SpanContext;
+  spawnToolSpanContext: SpanContext;
+  parentContext: Context;
+  createdAt: number;
+}
+
+interface RootSpanSeed {
+  parentContext?: Context;
+  links?: Link[];
+  attributes?: Record<string, string | number | boolean>;
+}
+
+/** Map of sessionKey -> active trace context. Cleaned up on agent_end. */
 const sessionContextMap = new Map<string, SessionTraceContext>();
+const pendingSpawnHandoffs = new Map<string, PendingSpawnHandoff[]>();
+const PENDING_SPAWN_TTL_MS = 60_000;
 
 function pushCandidate(target: string[], value: unknown): void {
   if (typeof value !== "string") return;
@@ -62,7 +80,119 @@ function pushCandidate(target: string[], value: unknown): void {
   target.push(trimmed);
 }
 
-function collectSessionKeys(event?: any, ctx?: any): string[] {
+function parseAgentIdFromSessionLike(value: string): string | undefined {
+  const match = /^agent:([^:]+):/.exec(value.trim());
+  return match?.[1];
+}
+
+function collectSpawnTargetAgentIds(target: string[], value: unknown, depth = 0): void {
+  if (depth > 4 || value == null) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    pushCandidate(target, parseAgentIdFromSessionLike(value));
+
+    const sessionMatches = value.matchAll(/agent:([^:\s]+):(main|subagent:[A-Za-z0-9-]+)/g);
+    for (const match of sessionMatches) {
+      pushCandidate(target, match[1]);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectSpawnTargetAgentIds(target, entry, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const normalizedKey = key.toLowerCase();
+    if (typeof entry === "string") {
+      if (
+        normalizedKey === "agentid" ||
+        normalizedKey === "targetagentid" ||
+        normalizedKey === "targetagent" ||
+        normalizedKey === "agent"
+      ) {
+        pushCandidate(target, entry);
+      }
+
+      if (normalizedKey === "sessionkey" || normalizedKey === "conversationid") {
+        pushCandidate(target, parseAgentIdFromSessionLike(entry));
+      }
+    }
+
+    collectSpawnTargetAgentIds(target, entry, depth + 1);
+  }
+}
+
+function extractMessageTextParts(message: any): string[] {
+  const content = message?.content;
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content
+    .map((part: any) => {
+      if (typeof part === "string") return part;
+      if (typeof part?.text === "string") return part.text;
+      return "";
+    })
+    .filter((part: string) => part.length > 0);
+}
+
+function extractSpawnTargetAgentIds(input: unknown, message: unknown): string[] {
+  const targetAgentIds: string[] = [];
+
+  collectSpawnTargetAgentIds(targetAgentIds, input);
+  collectSpawnTargetAgentIds(targetAgentIds, message);
+
+  for (const text of extractMessageTextParts(message)) {
+    collectSpawnTargetAgentIds(targetAgentIds, text);
+    try {
+      collectSpawnTargetAgentIds(targetAgentIds, JSON.parse(text));
+    } catch {
+      // Ignore non-JSON content.
+    }
+  }
+
+  return targetAgentIds;
+}
+
+function queuePendingSpawnHandoff(handoff: PendingSpawnHandoff): void {
+  const existing = pendingSpawnHandoffs.get(handoff.targetAgentId) ?? [];
+  existing.push(handoff);
+  pendingSpawnHandoffs.set(handoff.targetAgentId, existing);
+}
+
+function consumePendingSpawnHandoff(agentId: string): PendingSpawnHandoff | undefined {
+  const existing = pendingSpawnHandoffs.get(agentId);
+  if (!existing || existing.length === 0) {
+    return undefined;
+  }
+
+  const cutoff = Date.now() - PENDING_SPAWN_TTL_MS;
+  const fresh = existing.filter((entry) => entry.createdAt >= cutoff);
+  pendingSpawnHandoffs.delete(agentId);
+
+  if (fresh.length === 0) {
+    return undefined;
+  }
+
+  const [next, ...remaining] = fresh;
+  if (remaining.length > 0) {
+    pendingSpawnHandoffs.set(agentId, remaining);
+  }
+  return next;
+}
+
+function resolveSessionKey(event?: any, ctx?: any): string {
   const keys: string[] = [];
   const metadata = event?.metadata;
 
@@ -73,34 +203,12 @@ function collectSessionKeys(event?: any, ctx?: any): string[] {
   pushCandidate(keys, metadata?.sessionKey);
   pushCandidate(keys, metadata?.conversationId);
 
-  return keys;
-}
-
-function bindSessionAliases(sessionCtx: SessionTraceContext, keys: string[]): void {
-  for (const key of keys) {
-    sessionCtx.aliases.add(key);
-    sessionContextMap.set(key, sessionCtx);
-  }
+  return keys[0] || "unknown";
 }
 
 function getSessionTraceContext(event?: any, ctx?: any): SessionTraceContext | undefined {
-  const keys = collectSessionKeys(event, ctx);
-  for (const key of keys) {
-    const sessionCtx = sessionContextMap.get(key);
-    if (sessionCtx) {
-      bindSessionAliases(sessionCtx, keys);
-      return sessionCtx;
-    }
-  }
-  return undefined;
-}
-
-function cleanupSessionTraceContext(sessionCtx?: SessionTraceContext): void {
-  if (!sessionCtx) return;
-  for (const key of sessionCtx.aliases) {
-    sessionContextMap.delete(key);
-  }
-  sessionCtx.aliases.clear();
+  const sessionKey = resolveSessionKey(event, ctx);
+  return sessionContextMap.get(sessionKey);
 }
 
 function extractMessageText(event: any): string {
@@ -122,38 +230,67 @@ function extractMessageText(event: any): string {
   return "";
 }
 
+function resolveMessageFrom(event?: any, ctx?: any): string {
+  const metadata = event?.metadata;
+  const candidates = [
+    event?.from,
+    event?.senderId,
+    metadata?.from,
+    metadata?.senderId,
+    metadata?.userId,
+    metadata?.accountId,
+    ctx?.accountId,
+    ctx?.userId,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (trimmed) return trimmed;
+  }
+
+  return "unknown";
+}
+
 function startRootSpan(
-  tracer: TelemetryRuntime["tracer"],
+  tracer: any,
   event: any,
   ctx: any,
   config: OtelObservabilityConfig,
   logger: any,
   securityCounters: SecurityCounters,
-  counters: TelemetryRuntime["counters"]
-): SessionTraceContext | undefined {
-  const sessionKeys = collectSessionKeys(event, ctx);
-  const primarySessionKey = sessionKeys[0];
+  counters: any,
+  seed?: RootSpanSeed
+) {
+  const primarySessionKey = resolveSessionKey(event, ctx);
 
-  if (!primarySessionKey) {
-    logger.debug?.("[otel] Skipping eager request span start because no stable session/conversation key is available yet");
+  if (primarySessionKey === "unknown") {
+    logger.debug("[otel] Skipping eager request span start because no stable session/conversation key is available yet");
     return undefined;
   }
 
   const channel = event?.channel || ctx?.channelId || event?.metadata?.channelId || "unknown";
-  const from = event?.from || event?.senderId || "unknown";
+  const from = resolveMessageFrom(event, ctx);
   const messageText = extractMessageText(event);
 
-  const rootSpan = tracer.startSpan("openclaw.request", {
-    kind: SpanKind.SERVER,
-    attributes: {
-      [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.WORKFLOW,
-      [ATTR_OBSERVE_ENTITY_NAME]: "openclaw.request",
-      "openclaw.message.channel": channel,
-      "openclaw.session.key": primarySessionKey,
-      "openclaw.message.direction": "inbound",
-      "openclaw.message.from": from,
+  const parentContext = seed?.parentContext || context.active();
+  const rootSpan = tracer.startSpan(
+    "openclaw.request",
+    {
+      kind: SpanKind.SERVER,
+      attributes: {
+        [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.WORKFLOW,
+        [ATTR_OBSERVE_ENTITY_NAME]: "openclaw.request",
+        "openclaw.message.channel": channel,
+        "openclaw.session.key": primarySessionKey,
+        "openclaw.message.direction": "inbound",
+        "openclaw.message.from": from,
+        ...seed?.attributes,
+      },
+      links: seed?.links,
     },
-  });
+    parentContext
+  );
 
   if (messageText.length > 0) {
     const securityEvent = checkMessageSecurity(
@@ -163,19 +300,18 @@ function startRootSpan(
       primarySessionKey
     );
     if (securityEvent) {
-      logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
+      logger.warn(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
     }
   }
 
-  const rootContext = trace.setSpan(context.active(), rootSpan);
+  const rootContext = trace.setSpan(parentContext, rootSpan);
   const sessionCtx: SessionTraceContext = {
     rootSpan,
     rootContext,
     startTime: Date.now(),
-    aliases: new Set<string>(),
   };
 
-  bindSessionAliases(sessionCtx, sessionKeys);
+  sessionContextMap.set(primarySessionKey, sessionCtx);
   touchSession(primarySessionKey, rootContext);
 
   if (config.captureContent && messageText) {
@@ -186,7 +322,7 @@ function startRootSpan(
     "openclaw.message.channel": channel,
   });
 
-  logger.info?.(`[otel] Root span started for session=${primarySessionKey}, aliases=${sessionKeys.join(",")}, channel=${channel}`);
+  logger.info(`[otel] Root span started for session=${primarySessionKey}, channel=${channel}`);
   return sessionCtx;
 }
 
@@ -203,11 +339,11 @@ export function registerHooks(
   // Initialize loggers for sub-modules
   setHandoffLogger(logger);
   setForkJoinLogger(logger);
-  // ═══════════════════════════════════════════════════════════════════
-  // TYPED HOOKS — registered via api.on() into registry.typedHooks
-  // ═══════════════════════════════════════════════════════════════════
+  // ==================================================================
+  // TYPED HOOKS - registered via api.on() into registry.typedHooks
+  // ==================================================================
 
-  // ── message_received ─────────────────────────────────────────────
+  // -- message_received ------------------------------------------------
   // Creates the ROOT span for the entire request lifecycle.
   // All subsequent spans (agent, tools) become children of this span.
 
@@ -223,13 +359,11 @@ export function registerHooks(
     "message_received",
     async (event: any, ctx: any) => {
       try {
+        const sessionKey = resolveSessionKey(event, ctx);
         const sessionCtx = getSessionTraceContext(event, ctx);
         if (sessionCtx) {
-          const sessionKeys = collectSessionKeys(event, ctx);
-          bindSessionAliases(sessionCtx, sessionKeys);
-          const primarySessionKey = sessionKeys[0];
-          if (primarySessionKey) {
-            touchSession(primarySessionKey, sessionCtx.rootContext);
+          if (sessionKey !== "unknown") {
+            touchSession(sessionKey, sessionCtx.rootContext);
           }
 
           const messageText = extractMessageText(event);
@@ -240,42 +374,143 @@ export function registerHooks(
           startRootSpan(tracer, event, ctx, config, logger, securityCounters, counters);
         }
       } catch (error) {
-        logger.debug?.(`[otel] message_received hook failed: ${String(error)}`);
+        logger.debug(`[otel] message_received hook failed: ${String(error)}`);
         // Never let telemetry errors break the main flow
       }
     },
-    { priority: 100 } // High priority — run first to establish context
+    { priority: 100 } // High priority - run first to establish context
   );
 
   logger.info("[otel] Registered message_received hook (via api.on)");
 
-  // ── before_agent_start ───────────────────────────────────────────
+  api.on(
+    "message_sent",
+    async (event: any, ctx: any) => {
+      try {
+        const sessionKey = resolveSessionKey(event, ctx);
+        const sessionCtx = getSessionTraceContext(event, ctx);
+        const parentContext = sessionCtx?.rootContext || context.active();
+        const channel = event?.channel || ctx?.channelId || event?.metadata?.channelId || "unknown";
+        const messageText = extractMessageText(event);
+
+        const span = tracer.startSpan(
+          "openclaw.message.sent",
+          {
+            kind: SpanKind.PRODUCER,
+            attributes: {
+              [ATTR_OBSERVE_SPAN_KIND]: ObserveSpanKind.WORKFLOW,
+              [ATTR_OBSERVE_ENTITY_NAME]: "openclaw.message.sent",
+              "openclaw.message.channel": channel,
+              "openclaw.message.direction": "outbound",
+              "openclaw.session.key": sessionKey,
+            },
+          },
+          parentContext
+        );
+
+        if (config.captureContent && messageText) {
+          span.setAttribute(ATTR_OBSERVE_ENTITY_OUTPUT, messageText.slice(0, 4096));
+        }
+
+        counters.messagesSent.add(1, {
+          "openclaw.message.channel": channel,
+        });
+
+        if (sessionKey !== "unknown") {
+          touchSession(sessionKey, parentContext);
+        }
+
+        span.setStatus({ code: SpanStatusCode.OK });
+        span.end();
+      } catch (error) {
+        logger.debug(`[otel] message_sent hook failed: ${String(error)}`);
+      }
+
+      return undefined;
+    },
+    { priority: -90 }
+  );
+
+  logger.info("[otel] Registered message_sent hook (via api.on)");
+
+  // -- before_agent_start ----------------------------------------------
   // Creates an "agent turn" child span under the root request span.
 
   api.on(
     "before_agent_start",
     (event: any, ctx: any) => {
       try {
-        const sessionKeys = collectSessionKeys(event, ctx);
-        const sessionKey = sessionKeys[0] || "unknown";
+        const sessionKey = resolveSessionKey(event, ctx);
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const model = event?.model || "unknown";
 
         let sessionCtx = getSessionTraceContext(event, ctx);
+        const pendingSpawnHandoff = consumePendingSpawnHandoff(agentId);
         if (!sessionCtx) {
-          sessionCtx = startRootSpan(tracer, event, ctx, config, logger, securityCounters, counters);
+          const rootSeed: RootSpanSeed | undefined = pendingSpawnHandoff
+            ? {
+                parentContext: pendingSpawnHandoff.parentContext,
+                links: [
+                  {
+                    context: pendingSpawnHandoff.spawnToolSpanContext,
+                    attributes: {
+                      "link.type": "agent_spawn",
+                      "openclaw.handoff.source_session": pendingSpawnHandoff.sourceSessionKey,
+                      "openclaw.handoff.source_agent": pendingSpawnHandoff.sourceAgentId,
+                    },
+                  },
+                  ...(pendingSpawnHandoff.sourceAgentSpanContext
+                    ? [{
+                        context: pendingSpawnHandoff.sourceAgentSpanContext,
+                        attributes: {
+                          "link.type": "agent_handoff",
+                          "ioa_observe.agent.previous": pendingSpawnHandoff.sourceAgentId,
+                          "ioa_observe.agent.previous_sequence": pendingSpawnHandoff.sourceAgentSequence,
+                        },
+                      }]
+                    : []),
+                ],
+                attributes: {
+                  "openclaw.handoff.source_session": pendingSpawnHandoff.sourceSessionKey,
+                  "openclaw.handoff.source_agent": pendingSpawnHandoff.sourceAgentId,
+                },
+              }
+            : undefined;
+
+          sessionCtx = startRootSpan(
+            tracer,
+            event,
+            ctx,
+            config,
+            logger,
+            securityCounters,
+            counters,
+            rootSeed
+          );
         }
         const parentContext = sessionCtx?.rootContext || context.active();
+
+        if (pendingSpawnHandoff?.sourceAgentSpanContext) {
+          seedHandoffState(sessionKey, {
+            lastAgentSpanContext: pendingSpawnHandoff.sourceAgentSpanContext,
+            lastAgentName: pendingSpawnHandoff.sourceAgentId,
+            sequence: pendingSpawnHandoff.sourceAgentSequence,
+          });
+        }
 
         // Check for join from a previous parallel fork
         const joinInfo = consumeJoin(sessionKey);
         const joinLinks: Link[] = joinInfo?.links ?? [];
         if (joinInfo) {
-          logger.info?.(
+          logger.info(
             `[otel] Join detected for agent=${agentId}: forkId=${joinInfo.attributes["ioa_observe.join.fork_id"]}, ` +
             `branches=${joinInfo.attributes["ioa_observe.join.branch_count"]}`
           );
         }
+
+        // Prepare handoff links before span creation so OTel records them.
+        const handoff = onAgentStart(sessionKey, agentId);
+        const agentLinks: Link[] = [...joinLinks, ...handoff.links];
 
         // Create agent turn span as child of root span
         const agentSpan = tracer.startSpan(
@@ -288,16 +523,17 @@ export function registerHooks(
               "openclaw.agent.id": agentId,
               "openclaw.session.key": sessionKey,
               "openclaw.agent.model": model,
+              ...handoff.attributes,
             },
-            links: joinLinks,
+            links: agentLinks,
           },
           parentContext
         );
 
         // Annotate join metadata if this agent follows a fork
         if (joinInfo) {
-          for (const [k, v] of Object.entries(joinInfo.attributes)) {
-            agentSpan.setAttribute(k, v);
+          for (const key of Object.keys(joinInfo.attributes)) {
+            agentSpan.setAttribute(key, joinInfo.attributes[key]);
           }
           agentSpan.addEvent("agent.join", {
             "ioa_observe.join.fork_id": joinInfo.attributes["ioa_observe.join.fork_id"],
@@ -305,51 +541,41 @@ export function registerHooks(
           });
         }
 
-        // Agent handoff tracking — link back to previous agent
-        const handoff = onAgentStart(sessionKey, agentId, agentSpan);
-        for (const [k, v] of Object.entries(handoff.attributes)) {
-          agentSpan.setAttribute(k, v);
-        }
+        registerAgentSpan(sessionKey, agentId, agentSpan, handoff.sequence, handoff.previousAgentName);
         if (handoff.links.length > 0) {
-          logger.debug?.(
+          logger.debug(
             `[otel] Handoff links prepared for agent=${agentId}: ${handoff.links.length} link(s), ` +
             `seq=${handoff.attributes["ioa_observe.agent.sequence"]}, ` +
             `previous=${handoff.attributes["ioa_observe.agent.previous"] || "(none)"}`
           );
         }
-        // Note: span links cannot be added after creation in OTel JS,
-        // so handoff links will apply to the NEXT agent span via onAgentStart
 
         const agentContext = trace.setSpan(parentContext, agentSpan);
 
         // Store agent span context for tool spans
         if (sessionCtx) {
-          bindSessionAliases(sessionCtx, sessionKeys);
           sessionCtx.agentSpan = agentSpan;
           sessionCtx.agentContext = agentContext;
-        } else {
-          // No root span (e.g., heartbeat) — create a standalone context
-          const fallbackContext: SessionTraceContext = {
+        } else if (sessionKey !== "unknown") {
+          sessionContextMap.set(sessionKey, {
             rootSpan: agentSpan,
             rootContext: agentContext,
             agentSpan,
             agentContext,
             startTime: Date.now(),
-            aliases: new Set<string>(),
-          };
-          bindSessionAliases(fallbackContext, sessionKeys.length > 0 ? sessionKeys : [sessionKey]);
+          });
         }
 
         // Register in activeAgentSpans for diagnostics integration
         activeAgentSpans.set(sessionKey, agentSpan);
 
-        logger.info?.(`[otel] Agent turn started: agent=${agentId}, model=${model}, session=${sessionKey}`);
+        logger.info(`[otel] Agent turn started: agent=${agentId}, model=${model}, session=${sessionKey}`);
       } catch (error) {
-        logger.debug?.(`[otel] before_agent_start hook failed: ${String(error)}`);
+        logger.debug(`[otel] before_agent_start hook failed: ${String(error)}`);
         // Silently ignore
       }
 
-      // Return undefined — don't modify system prompt
+      // Return undefined - don't modify system prompt
       return undefined;
     },
     { priority: 90 }
@@ -357,9 +583,9 @@ export function registerHooks(
 
   logger.info("[otel] Registered before_agent_start hook (via api.on)");
 
-  // ── tool_result_persist ──────────────────────────────────────────
+  // -- tool_result_persist ---------------------------------------------
   // Creates a child span under the agent turn span for each tool call.
-  // SYNCHRONOUS — must not return a Promise.
+  // SYNCHRONOUS - must not return a Promise.
 
   api.on(
     "tool_result_persist",
@@ -368,7 +594,7 @@ export function registerHooks(
         const toolName = event?.toolName || "unknown";
         const toolCallId = event?.toolCallId || "";
         const isSynthetic = event?.isSynthetic === true;
-        const sessionKey = ctx?.sessionKey || "unknown";
+        const sessionKey = resolveSessionKey(event, ctx);
         const agentId = ctx?.agentId || "unknown";
 
         // Tool input is available in event.input for security checks
@@ -380,8 +606,8 @@ export function registerHooks(
           "session.key": sessionKey,
         });
 
-        // Get parent context — prefer agent turn span, fall back to root
-        const sessionCtx = sessionContextMap.get(sessionKey);
+        // Get parent context - prefer agent turn span, fall back to root
+        const sessionCtx = getSessionTraceContext(event, ctx);
         const parentContext = sessionCtx?.agentContext || sessionCtx?.rootContext || context.active();
 
         // Create tool span as child of agent turn
@@ -405,14 +631,14 @@ export function registerHooks(
         // Track session activity
         touchSession(sessionKey, parentContext);
 
-        // Fork detection — register this tool span for parallel detection
+        // Fork detection - register this tool span for parallel detection
         const agentSequence = getHandoffSequence(sessionKey);
         const forkAttrs = registerToolSpan(sessionKey, toolName, span, agentId, agentSequence);
         if (forkAttrs) {
-          for (const [k, v] of Object.entries(forkAttrs)) {
-            span.setAttribute(k, v);
+          for (const key of Object.keys(forkAttrs)) {
+            span.setAttribute(key, forkAttrs[key]);
           }
-          logger.info?.(
+          logger.info(
             `[otel] Tool in fork group: tool=${toolName}, forkId=${forkAttrs["ioa_observe.fork.id"]}, ` +
             `branch=${forkAttrs["ioa_observe.fork.branch_index"]}`
           );
@@ -424,7 +650,7 @@ export function registerHooks(
           span.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, inputStr.slice(0, 4096));
         }
 
-        // ═══ SECURITY DETECTION 1 & 3: File Access & Dangerous Commands ═══
+        // SECURITY DETECTION 1 & 3: File Access & Dangerous Commands
         const securityEvent = checkToolSecurity(
           toolName,
           toolInput,
@@ -434,7 +660,7 @@ export function registerHooks(
           agentId
         );
         if (securityEvent) {
-          logger.warn?.(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
+          logger.warn(`[otel] SECURITY: ${securityEvent.detection} - ${securityEvent.description}`);
           // Add tool input details to span for forensics
           if (toolInput) {
             const inputStr = JSON.stringify(toolInput).slice(0, 1000);
@@ -445,6 +671,35 @@ export function registerHooks(
         // Inspect the message for result metadata
         const message = event?.message;
         if (message) {
+          if (toolName === "sessions_spawn") {
+            const targetAgentIds = extractSpawnTargetAgentIds(toolInput, message);
+            const sourceAgentSpanContext = sessionCtx?.agentSpan?.spanContext();
+
+            for (const targetAgentId of targetAgentIds) {
+              queuePendingSpawnHandoff({
+                targetAgentId,
+                sourceSessionKey: sessionKey,
+                sourceAgentId: agentId,
+                sourceAgentSequence: agentSequence,
+                sourceAgentSpanContext,
+                spawnToolSpanContext: span.spanContext(),
+                parentContext: trace.setSpan(parentContext, span),
+                createdAt: Date.now(),
+              });
+            }
+
+            if (targetAgentIds.length > 0) {
+              logger.info(
+                `[otel] Prepared subagent handoff from agent=${agentId} to ` +
+                `[${targetAgentIds.join(", ")}], session=${sessionKey}`
+              );
+            } else {
+              logger.debug(
+                `[otel] sessions_spawn result captured but target agent could not be resolved, session=${sessionKey}`
+              );
+            }
+          }
+
           const contentArray = message?.content;
           if (contentArray && Array.isArray(contentArray)) {
             const textParts = contentArray
@@ -484,7 +739,7 @@ export function registerHooks(
 
   logger.info("[otel] Registered tool_result_persist hook (via api.on)");
 
-  // ── agent_end ────────────────────────────────────────────────────
+  // -- agent_end -------------------------------------------------------
   // Ends the agent turn span AND the root request span.
   // Event shape from OpenClaw:
   //   event: { messages, success, error?, durationMs }
@@ -495,8 +750,7 @@ export function registerHooks(
     "agent_end",
     async (event: any, ctx: any) => {
       try {
-        const sessionKeys = collectSessionKeys(event, ctx);
-        const sessionKey = sessionKeys[0] || "unknown";
+        const sessionKey = resolveSessionKey(event, ctx);
         const agentId = event?.agentId || ctx?.agentId || "unknown";
         const durationMs = event?.durationMs;
         const success = event?.success !== false;
@@ -522,7 +776,7 @@ export function registerHooks(
           cacheWriteTokens = diagUsage.usage.cacheWrite || 0;
           model = diagUsage.model || "unknown";
           costUsd = diagUsage.costUsd;
-          logger.debug?.(`[otel] agent_end using diagnostic data: cost=$${costUsd?.toFixed(4) || "?"}`);
+          logger.debug(`[otel] agent_end using diagnostic data: cost=$${costUsd?.toFixed(4) || "?"}`);
         } else {
           // Fallback: parse messages manually
           for (const msg of messages) {
@@ -547,7 +801,7 @@ export function registerHooks(
         }
 
         const totalTokens = totalInputTokens + totalOutputTokens + cacheReadTokens + cacheWriteTokens;
-        logger.debug?.(`[otel] agent_end tokens: input=${totalInputTokens}, output=${totalOutputTokens}, cache_read=${cacheReadTokens}, cache_write=${cacheWriteTokens}, model=${model}`);
+        logger.debug(`[otel] agent_end tokens: input=${totalInputTokens}, output=${totalOutputTokens}, cache_read=${cacheReadTokens}, cache_write=${cacheWriteTokens}, model=${model}`);
 
         const sessionCtx = getSessionTraceContext(event, ctx);
 
@@ -559,12 +813,15 @@ export function registerHooks(
             agentSpan.setAttribute("openclaw.agent.duration_ms", durationMs);
           }
 
-          // Token usage — GenAI semantic convention attributes
+          // Token usage - GenAI semantic convention attributes
           agentSpan.setAttribute("gen_ai.usage.input_tokens", totalInputTokens);
           agentSpan.setAttribute("gen_ai.usage.output_tokens", totalOutputTokens);
           agentSpan.setAttribute("gen_ai.usage.total_tokens", totalTokens);
           agentSpan.setAttribute("gen_ai.response.model", model);
           agentSpan.setAttribute("openclaw.agent.success", success);
+          if (model !== "unknown") {
+            agentSpan.setAttribute("openclaw.agent.model", model);
+          }
 
           // Cache tokens (custom attributes)
           if (cacheReadTokens > 0) {
@@ -574,9 +831,13 @@ export function registerHooks(
             agentSpan.setAttribute("gen_ai.usage.cache_write_tokens", cacheWriteTokens);
           }
 
-          // Cost (from diagnostic events) — this is the key addition!
+          // Cost (from diagnostic events) - this is the key addition!
           if (typeof costUsd === "number") {
             agentSpan.setAttribute("openclaw.llm.cost_usd", costUsd);
+          }
+
+          if (diagUsage?.provider) {
+            agentSpan.setAttribute("gen_ai.system", diagUsage.provider);
           }
 
           // Context window (from diagnostic events)
@@ -617,14 +878,14 @@ export function registerHooks(
               "ioa_observe.fork.id": forkResult.forkId,
               "ioa_observe.fork.branch_count": forkResult.branchCount,
             });
-            logger.info?.(
+            logger.info(
               `[otel] Fork completed: agent=${agentId}, forkId=${forkResult.forkId}, branches=${forkResult.branchCount}`
             );
           }
 
           // Update handoff state so next agent can link back
           onAgentEnd(sessionKey, agentId, agentSpan);
-          logger.info?.(
+          logger.info(
             `[otel] Agent turn ended: agent=${agentId}, session=${sessionKey}, ` +
             `success=${success}, duration=${durationMs ?? "?"}ms, ` +
             `tokens=${totalTokens}, cost=$${costUsd?.toFixed(4) ?? "?"}`
@@ -649,14 +910,16 @@ export function registerHooks(
         }
 
         // Clean up all per-session state
-        cleanupSessionTraceContext(sessionCtx);
+        if (sessionKey !== "unknown") {
+          sessionContextMap.delete(sessionKey);
+        }
         activeAgentSpans.delete(sessionKey);
         cleanupHandoff(sessionKey);
         cleanupForkJoin(sessionKey);
 
-        logger.info?.(`[otel] Trace completed for session=${sessionKey}`);
+        logger.info(`[otel] Trace completed for session=${sessionKey}`);
       } catch (error) {
-        logger.debug?.(`[otel] agent_end hook failed: ${String(error)}`);
+        logger.debug(`[otel] agent_end hook failed: ${String(error)}`);
         // Silently ignore
       }
     },
@@ -665,11 +928,11 @@ export function registerHooks(
 
   logger.info("[otel] Registered agent_end hook (via api.on)");
 
-  // ═══════════════════════════════════════════════════════════════════
-  // EVENT-STREAM HOOKS — registered via api.registerHook()
-  // ═══════════════════════════════════════════════════════════════════
+  // ==================================================================
+  // EVENT-STREAM HOOKS - registered via api.registerHook()
+  // ==================================================================
 
-  // ── Command event hooks ──────────────────────────────────────────
+  // -- Command event hooks ---------------------------------------------
 
   api.registerHook(
     ["command:new", "command:reset", "command:stop"],
@@ -701,7 +964,7 @@ export function registerHooks(
           });
           // End session lifecycle tracking on reset
           endSession(sessionKey);
-          logger.info?.(`[otel] Session ended via command:${action}: session=${sessionKey}`);
+          logger.info(`[otel] Session ended via command:${action}: session=${sessionKey}`);
         }
 
         span.setStatus({ code: SpanStatusCode.OK });
@@ -718,7 +981,7 @@ export function registerHooks(
 
   logger.info("[otel] Registered command event hooks (via api.registerHook)");
 
-  // ── Gateway startup hook ─────────────────────────────────────────
+  // -- Gateway startup hook --------------------------------------------
 
   api.registerHook(
     "gateway:startup",
@@ -745,23 +1008,24 @@ export function registerHooks(
 
   logger.info("[otel] Registered gateway:startup hook (via api.registerHook)");
 
-  // ── Periodic cleanup ─────────────────────────────────────────────
+  // -- Periodic cleanup ------------------------------------------------
   // Safety net: clean up stale session contexts (e.g., if agent_end never fires)
   setInterval(() => {
     const now = Date.now();
     const maxAge = 5 * 60 * 1000; // 5 minutes
-    for (const ctx of new Set(sessionContextMap.values())) {
+    for (const [key, ctx] of sessionContextMap) {
       if (now - ctx.startTime > maxAge) {
-        const staleKey = [...ctx.aliases][0] || "unknown";
         try {
           ctx.agentSpan?.end();
           if (ctx.rootSpan !== ctx.agentSpan) ctx.rootSpan?.end();
         } catch { /* ignore */ }
-        cleanupSessionTraceContext(ctx);
-        cleanupHandoff(staleKey);
-        cleanupForkJoin(staleKey);
-        logger.debug?.(`[otel] Cleaned up stale trace context for session=${staleKey}`);
+        sessionContextMap.delete(key);
+        cleanupHandoff(key);
+        cleanupForkJoin(key);
+        logger.debug(`[otel] Cleaned up stale trace context for session=${key}`);
       }
     }
   }, 60_000);
 }
+
+export default registerHooks;

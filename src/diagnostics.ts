@@ -46,6 +46,165 @@ interface PendingUsageData {
   model?: string;
 }
 
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) continue;
+      const parsed = Number(trimmed);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return undefined;
+}
+
+function resolveDiagnosticSessionKey(evt: any): string {
+  return firstString(
+    evt?.sessionKey,
+    evt?.conversationId,
+    evt?.metadata?.sessionKey,
+    evt?.metadata?.conversationId,
+    evt?.context?.sessionKey,
+    evt?.context?.conversationId
+  ) || "unknown";
+}
+
+function normalizeUsageData(rawUsage: any): PendingUsageData["usage"] {
+  const usage = rawUsage || {};
+  const metadata = usage.usageMetadata || usage.metadata || {};
+  const input = firstNumber(
+    usage.input,
+    usage.inputTokens,
+    usage.input_tokens,
+    usage.prompt,
+    usage.promptTokens,
+    usage.prompt_tokens,
+    usage.promptTokenCount,
+    metadata.input,
+    metadata.inputTokens,
+    metadata.input_tokens,
+    metadata.prompt,
+    metadata.promptTokens,
+    metadata.prompt_tokens,
+    metadata.promptTokenCount
+  );
+  const output = firstNumber(
+    usage.output,
+    usage.outputTokens,
+    usage.output_tokens,
+    usage.completion,
+    usage.completionTokens,
+    usage.completion_tokens,
+    usage.candidatesTokenCount,
+    usage.outputTokenCount,
+    metadata.output,
+    metadata.outputTokens,
+    metadata.output_tokens,
+    metadata.completion,
+    metadata.completionTokens,
+    metadata.completion_tokens,
+    metadata.candidatesTokenCount,
+    metadata.outputTokenCount
+  );
+  const cacheRead = firstNumber(
+    usage.cacheRead,
+    usage.cache_read,
+    usage.cacheReadTokens,
+    usage.cache_read_tokens,
+    usage.cachedContentTokenCount,
+    metadata.cacheRead,
+    metadata.cache_read,
+    metadata.cacheReadTokens,
+    metadata.cache_read_tokens,
+    metadata.cachedContentTokenCount
+  );
+  const cacheWrite = firstNumber(
+    usage.cacheWrite,
+    usage.cache_write,
+    usage.cacheCreation,
+    usage.cacheCreationInputTokens,
+    usage.cache_creation_input_tokens,
+    usage.cacheWriteTokens,
+    usage.cache_write_tokens,
+    metadata.cacheWrite,
+    metadata.cache_write,
+    metadata.cacheCreation,
+    metadata.cacheCreationInputTokens,
+    metadata.cache_creation_input_tokens,
+    metadata.cacheWriteTokens,
+    metadata.cache_write_tokens
+  );
+  const total = firstNumber(
+    usage.total,
+    usage.totalTokens,
+    usage.total_tokens,
+    usage.totalTokenCount,
+    metadata.total,
+    metadata.totalTokens,
+    metadata.total_tokens,
+    metadata.totalTokenCount,
+    input !== undefined || output !== undefined || cacheRead !== undefined || cacheWrite !== undefined
+      ? (input || 0) + (output || 0) + (cacheRead || 0) + (cacheWrite || 0)
+      : undefined
+  );
+
+  return { input, output, cacheRead, cacheWrite, total };
+}
+
+function summarizeDiagnosticShape(evt: any): Record<string, unknown> {
+  const usage = evt?.usage || {};
+  const metadata = usage?.usageMetadata || usage?.metadata || {};
+
+  return {
+    topLevelKeys: Object.keys(evt || {}).sort(),
+    usageKeys: Object.keys(usage).sort(),
+    usageMetadataKeys: Object.keys(metadata).sort(),
+    sessionCandidates: {
+      sessionKey: evt?.sessionKey,
+      conversationId: evt?.conversationId,
+      contextSessionKey: evt?.context?.sessionKey,
+      contextConversationId: evt?.context?.conversationId,
+    },
+    modelCandidates: {
+      model: evt?.model,
+      modelName: evt?.modelName,
+      provider: evt?.provider,
+      vendor: evt?.vendor,
+      system: evt?.system,
+    },
+    tokenCandidates: {
+      usageInput: usage?.input,
+      usageOutput: usage?.output,
+      usageTotal: usage?.total,
+      usageInputTokens: usage?.inputTokens,
+      usageOutputTokens: usage?.outputTokens,
+      usageTotalTokens: usage?.totalTokens,
+      usagePromptTokenCount: usage?.promptTokenCount,
+      usageCandidatesTokenCount: usage?.candidatesTokenCount,
+      usageTotalTokenCount: usage?.totalTokenCount,
+      metadataPromptTokenCount: metadata?.promptTokenCount,
+      metadataCandidatesTokenCount: metadata?.candidatesTokenCount,
+      metadataTotalTokenCount: metadata?.totalTokenCount,
+    },
+  };
+}
+
 /** Map of sessionKey → pending usage data from diagnostic events */
 const pendingUsageMap = new Map<string, PendingUsageData>();
 
@@ -64,7 +223,7 @@ export async function registerDiagnosticsListener(
   await loadSdk();
 
   if (!onDiagnosticEvent) {
-    logger.debug?.("[otel] onDiagnosticEvent not available — using fallback token extraction");
+    logger.debug("[otel] onDiagnosticEvent not available — using fallback token extraction");
     return () => {};
   }
 
@@ -73,21 +232,22 @@ export async function registerDiagnosticsListener(
   const unsubscribe = onDiagnosticEvent((evt: any) => {
     if (evt.type !== "model.usage") return;
 
-    const sessionKey = evt.sessionKey || "unknown";
-    const usage = evt.usage || {};
+    const sessionKey = resolveDiagnosticSessionKey(evt);
+    const usage = normalizeUsageData(evt.usage);
     const costUsd = evt.costUsd;
-    const model = evt.model || "unknown";
-    const provider = evt.provider || "unknown";
-
-    // Store for later attachment to agent span
-    pendingUsageMap.set(sessionKey, {
+    const model = firstString(evt.model, evt.modelName) || "unknown";
+    const provider = firstString(evt.provider, evt.vendor, evt.system) || "unknown";
+    const pendingUsage: PendingUsageData = {
       costUsd,
       usage,
       context: evt.context,
       durationMs: evt.durationMs,
       provider,
       model,
-    });
+    };
+
+    // Store for later attachment to agent span
+    pendingUsageMap.set(sessionKey, pendingUsage);
 
     // Record metrics immediately (don't wait for span)
     const metricAttrs = {
@@ -95,20 +255,24 @@ export async function registerDiagnosticsListener(
       "openclaw.provider": provider,
     };
 
-    if (usage.input) {
+    if (usage.input !== undefined) {
       counters.tokensPrompt.add(usage.input, metricAttrs);
     }
-    if (usage.output) {
+    if (usage.output !== undefined) {
       counters.tokensCompletion.add(usage.output, metricAttrs);
     }
-    if (usage.cacheRead) {
+    if (usage.cacheRead !== undefined) {
       counters.tokensPrompt.add(usage.cacheRead, { ...metricAttrs, "token.type": "cache_read" });
     }
-    if (usage.cacheWrite) {
+    if (usage.cacheWrite !== undefined) {
       counters.tokensPrompt.add(usage.cacheWrite, { ...metricAttrs, "token.type": "cache_write" });
     }
-    if (usage.total) {
+    if (usage.total !== undefined) {
       counters.tokensTotal.add(usage.total, metricAttrs);
+    }
+
+    if (model !== "unknown" && usage.input === undefined && usage.output === undefined && usage.total === undefined) {
+      logger.debug(`[otel] model.usage unresolved token shape: ${JSON.stringify(summarizeDiagnosticShape(evt))}`);
     }
 
     // Record cost metric
@@ -129,11 +293,11 @@ export async function registerDiagnosticsListener(
     // If we have an active agent span for this session, enrich it now
     const agentSpan = activeAgentSpans.get(sessionKey);
     if (agentSpan) {
-      enrichSpanWithUsage(agentSpan, evt);
+      enrichSpanWithUsage(agentSpan, pendingUsage);
       pendingUsageMap.delete(sessionKey);
     }
 
-    logger.debug?.(`[otel] model.usage: session=${sessionKey}, model=${model}, cost=$${costUsd?.toFixed(4) || "?"}, tokens=${usage.total || "?"}`);
+    logger.debug(`[otel] model.usage: session=${sessionKey}, model=${model}, cost=$${costUsd?.toFixed(4) || "?"}, tokens=${usage.total || "?"}`);
   });
 
   logger.info("[otel] Subscribed to OpenClaw diagnostic events (model.usage, etc.)");
