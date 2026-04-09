@@ -27,12 +27,34 @@ const { AnthropicInstrumentation } = await import("@traceloop/instrumentation-an
 const { BedrockInstrumentation } = await import("@traceloop/instrumentation-bedrock");
 const { OpenAIInstrumentation } = await import("@traceloop/instrumentation-openai");
 const { VertexAIInstrumentation } = await import("@traceloop/instrumentation-vertexai");
+const { trace } = await import("@opentelemetry/api");
+const { AsyncLocalStorageContextManager } = await import("@opentelemetry/context-async-hooks");
+
+/**
+ * Custom ContextManager that falls back to the agent context stored by
+ * hooks.ts when the async chain between a hook callback and the actual
+ * LLM call is broken (e.g. OpenClaw dispatches hooks then calls Anthropic
+ * in a separate async turn). This ensures auto-instrumented LLM spans
+ * (OpenLLMetry) are correctly parented under the active agent span.
+ *
+ * hooks.ts sets globalThis.__OPENCLAW_ACTIVE_AGENT_CONTEXT in before_agent_start
+ * and clears it in agent_end.
+ */
+class AgentAwareContextManager extends AsyncLocalStorageContextManager {
+  active() {
+    const ctx = super.active();
+    if (!trace.getSpan(ctx) && globalThis.__OPENCLAW_ACTIVE_AGENT_CONTEXT) {
+      return globalThis.__OPENCLAW_ACTIVE_AGENT_CONTEXT;
+    }
+    return ctx;
+  }
+}
 
 const providerInstrumentations = [
-  new AnthropicInstrumentation({ traceContent: false }),
-  new BedrockInstrumentation({ traceContent: false }),
-  new OpenAIInstrumentation({ traceContent: false }),
-  new VertexAIInstrumentation({ traceContent: false }),
+  new AnthropicInstrumentation({ traceContent: true }),
+  new BedrockInstrumentation({ traceContent: true }),
+  new OpenAIInstrumentation({ traceContent: true }),
+  new VertexAIInstrumentation({ traceContent: true }),
 ];
 const providerNames = ["anthropic", "bedrock", "openai", "vertexai"];
 
@@ -53,6 +75,7 @@ const sdk = new NodeSDK({
   resource,
   spanProcessors: [new BatchSpanProcessor(traceExporter)],
   instrumentations: providerInstrumentations,
+  contextManager: new AgentAwareContextManager().enable(),
 });
 
 sdk.start();
