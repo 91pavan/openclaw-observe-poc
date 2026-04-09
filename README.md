@@ -30,6 +30,11 @@ openclaw.request (root span)
 - Explicit `llm_input` and `llm_output` spans when available
 - Token usage and model/provider attributes on both LLM and agent spans
 - Fallback token extraction from `agent_end` messages when diagnostics are unavailable
+- Diagnostic `model.usage` spans plus cost/context metrics from OpenClaw diagnostics
+
+**Gateway Diagnostics:**
+- Webhook, queue, message, session, and tool-loop diagnostics recorded as OTel metrics/spans
+- Session state and stuck-session signals available alongside connected request traces
 
 **Agent Payload Visibility:**
 - Optional agent input/output payload capture on `openclaw.agent.turn`
@@ -128,8 +133,8 @@ hook before the SDKs are imported.
 |---------|-----------------|---------------|
 | Token metrics | ✅ Per model | ✅ Per session + model |
 | Cost tracking | ✅ Yes | ✅ Yes (from diagnostics) |
-| Gateway health | ✅ Webhooks, queues, sessions | ❌ Not focused |
-| Session state | ✅ State transitions | ❌ Not tracked |
+| Gateway health | ✅ Webhooks, queues, sessions | ✅ Via diagnostics listener |
+| Session state | ✅ State transitions | ✅ Via diagnostics listener |
 | **Tool call tracing** | ❌ No | ✅ Individual tool spans |
 | **Request lifecycle** | ❌ No | ✅ Full request → response |
 | **Connected traces** | ❌ Separate spans | ✅ Parent-child hierarchy |
