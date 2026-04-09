@@ -48,6 +48,7 @@ interface SessionTraceContext {
   rootContext: Context;
   agentSpan?: Span;
   agentContext?: Context;
+  latestInput?: string;
   startTime: number;
 }
 
@@ -72,6 +73,7 @@ interface RootSpanSeed {
 const sessionContextMap = new Map<string, SessionTraceContext>();
 const pendingSpawnHandoffs = new Map<string, PendingSpawnHandoff[]>();
 const PENDING_SPAWN_TTL_MS = 60_000;
+const MAX_CAPTURE_CONTENT_CHARS = 4_096;
 
 function pushCandidate(target: string[], value: unknown): void {
   if (typeof value !== "string") return;
@@ -230,6 +232,118 @@ function extractMessageText(event: any): string {
   return "";
 }
 
+function truncateCapturedContent(value: string): string {
+  return value.slice(0, MAX_CAPTURE_CONTENT_CHARS);
+}
+
+function serializeCapturedContent(value: unknown): string | undefined {
+  if (value == null) {
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? truncateCapturedContent(trimmed) : undefined;
+  }
+
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized ? truncateCapturedContent(serialized) : undefined;
+  } catch {
+    const fallback = String(value).trim();
+    return fallback ? truncateCapturedContent(fallback) : undefined;
+  }
+}
+
+function setCapturedContent(
+  span: Span,
+  direction: "input" | "output",
+  value: unknown,
+  attrPrefixes: string[] = []
+): string | undefined {
+  const serialized = serializeCapturedContent(value);
+  if (!serialized) {
+    return undefined;
+  }
+
+  const observeAttr =
+    direction === "input" ? ATTR_OBSERVE_ENTITY_INPUT : ATTR_OBSERVE_ENTITY_OUTPUT;
+  span.setAttribute(observeAttr, serialized);
+  span.setAttribute(`openclaw.entity.${direction}`, serialized);
+  for (const prefix of attrPrefixes) {
+    span.setAttribute(`${prefix}.${direction}`, serialized);
+  }
+
+  return serialized;
+}
+
+function extractLatestAssistantOutput(messages: any[]): unknown {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") {
+      continue;
+    }
+
+    const text = extractMessageText(message);
+    if (text) {
+      return text;
+    }
+
+    if (message?.content != null) {
+      return message.content;
+    }
+
+    if (message?.message != null) {
+      return message.message;
+    }
+  }
+
+  return undefined;
+}
+
+function extractToolOutputPayload(event: any, message: any): unknown {
+  const textParts = extractMessageTextParts(message);
+  if (textParts.length > 0) {
+    return textParts.join("");
+  }
+
+  const candidates = [
+    message?.content,
+    message?.result,
+    message?.data,
+    event?.output,
+    event?.result,
+    event?.data,
+    message,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate == null) {
+      continue;
+    }
+
+    if (typeof candidate === "string") {
+      const trimmed = candidate.trim();
+      if (trimmed) {
+        return trimmed;
+      }
+      continue;
+    }
+
+    if (Array.isArray(candidate) && candidate.length === 0) {
+      continue;
+    }
+
+    if (typeof candidate === "object" && Object.keys(candidate).length === 0) {
+      continue;
+    }
+
+    return candidate;
+  }
+
+  return undefined;
+}
+
 function resolveMessageFrom(event?: any, ctx?: any): string {
   const metadata = event?.metadata;
   const candidates = [
@@ -305,18 +419,18 @@ function startRootSpan(
   }
 
   const rootContext = trace.setSpan(parentContext, rootSpan);
+  const capturedInput = config.captureContent
+    ? setCapturedContent(rootSpan, "input", messageText, ["openclaw.request"])
+    : undefined;
   const sessionCtx: SessionTraceContext = {
     rootSpan,
     rootContext,
+    latestInput: capturedInput,
     startTime: Date.now(),
   };
 
   sessionContextMap.set(primarySessionKey, sessionCtx);
   touchSession(primarySessionKey, rootContext);
-
-  if (config.captureContent && messageText) {
-    rootSpan.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, String(messageText).slice(0, 4096));
-  }
 
   counters.messagesReceived.add(1, {
     "openclaw.message.channel": channel,
@@ -367,8 +481,13 @@ export function registerHooks(
           }
 
           const messageText = extractMessageText(event);
-          if (config.captureContent && messageText) {
-            sessionCtx.rootSpan.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, messageText.slice(0, 4096));
+          if (config.captureContent) {
+            sessionCtx.latestInput = setCapturedContent(
+              sessionCtx.rootSpan,
+              "input",
+              messageText,
+              ["openclaw.request"]
+            ) ?? sessionCtx.latestInput;
           }
         } else {
           startRootSpan(tracer, event, ctx, config, logger, securityCounters, counters);
@@ -408,8 +527,8 @@ export function registerHooks(
           parentContext
         );
 
-        if (config.captureContent && messageText) {
-          span.setAttribute(ATTR_OBSERVE_ENTITY_OUTPUT, messageText.slice(0, 4096));
+        if (config.captureContent) {
+          setCapturedContent(span, "output", messageText, ["openclaw.message"]);
         }
 
         counters.messagesSent.add(1, {
@@ -530,6 +649,10 @@ export function registerHooks(
           parentContext
         );
 
+        if (config.captureContent && sessionCtx?.latestInput) {
+          setCapturedContent(agentSpan, "input", sessionCtx.latestInput, ["openclaw.agent"]);
+        }
+
         // Annotate join metadata if this agent follows a fork
         if (joinInfo) {
           for (const key of Object.keys(joinInfo.attributes)) {
@@ -645,9 +768,8 @@ export function registerHooks(
         }
 
         // Capture tool input if configured
-        if (config.captureContent && toolInput) {
-          const inputStr = typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput);
-          span.setAttribute(ATTR_OBSERVE_ENTITY_INPUT, inputStr.slice(0, 4096));
+        if (config.captureContent) {
+          setCapturedContent(span, "input", toolInput, ["openclaw.tool"]);
         }
 
         // SECURITY DETECTION 1 & 3: File Access & Dangerous Commands
@@ -708,11 +830,15 @@ export function registerHooks(
             const totalChars = textParts.reduce((sum: number, t: string) => sum + t.length, 0);
             span.setAttribute("openclaw.tool.result_chars", totalChars);
             span.setAttribute("openclaw.tool.result_parts", contentArray.length);
+          }
 
-            // Capture tool output if configured
-            if (config.captureContent && textParts.length > 0) {
-              span.setAttribute(ATTR_OBSERVE_ENTITY_OUTPUT, textParts.join("").slice(0, 4096));
-            }
+          if (config.captureContent) {
+            setCapturedContent(
+              span,
+              "output",
+              extractToolOutputPayload(event, message),
+              ["openclaw.tool"]
+            );
           }
 
           if (message?.is_error === true || message?.isError === true) {
@@ -808,6 +934,15 @@ export function registerHooks(
         // End the agent turn span
         if (sessionCtx?.agentSpan) {
           const agentSpan = sessionCtx.agentSpan;
+
+          if (config.captureContent) {
+            setCapturedContent(
+              agentSpan,
+              "output",
+              extractLatestAssistantOutput(messages),
+              ["openclaw.agent"]
+            );
+          }
 
           if (typeof durationMs === "number") {
             agentSpan.setAttribute("openclaw.agent.duration_ms", durationMs);

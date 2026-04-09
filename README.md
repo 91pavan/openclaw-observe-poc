@@ -23,12 +23,18 @@ openclaw.request (root span)
 - Individual spans for each tool call
 - Explicit tool start/end lifecycle hooks when OpenClaw exposes them
 - Tool execution time and result size
+- Optional tool input/output payload capture on tool spans
 - Error tracking per tool
 
 **Per-LLM Visibility:**
 - Explicit `llm_input` and `llm_output` spans when available
 - Token usage and model/provider attributes on both LLM and agent spans
 - Fallback token extraction from `agent_end` messages when diagnostics are unavailable
+
+**Agent Payload Visibility:**
+- Optional agent input/output payload capture on `openclaw.agent.turn`
+- Request input captured on the root request span
+- Outbound message payload captured on `openclaw.message.sent`
 
 **Request Lifecycle:**
 - Full message → response tracing
@@ -157,6 +163,7 @@ hook before the SDKs are imported.
 | `exporterType` | string | "otlp" | Exporter type |
 | `enableTraces` | boolean | true | Enable traces |
 | `enableMetrics` | boolean | true | Enable metrics |
+| `captureContent` | boolean | false | Capture request, agent, tool, and response payload content in spans |
 
 ---
 
