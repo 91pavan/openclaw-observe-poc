@@ -30,8 +30,8 @@
       "label": "Enable Logs"
     },
     "captureContent": {
-      "label": "Capture Prompt/Completion Content",
-      "help": "When enabled, records actual prompt and completion text in spans. Disable for privacy."
+      "label": "Capture Agent/Tool Payload Content",
+      "help": "When enabled, records request, agent, tool, and response payload content in spans. Disable for privacy."
     },
     "metricsIntervalMs": {
       "label": "Metrics Export Interval (ms)",
@@ -80,7 +80,7 @@
       },
       "captureContent": {
         "type": "boolean",
-        "description": "Capture prompt/completion content in spans"
+        "description": "Capture request, agent, tool, and response payload content in spans"
       },
       "metricsIntervalMs": {
         "type": "integer",
