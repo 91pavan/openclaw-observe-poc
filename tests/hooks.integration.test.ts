@@ -92,6 +92,9 @@ test("registerHooks wires lifecycle hooks that create and complete request spans
   assert.deepEqual([...typedHooks.keys()].sort(), [
     "agent_end",
     "before_agent_start",
+    "before_model_resolve",
+    "before_prompt_build",
+    "before_tool_call",
     "message_received",
     "message_sent",
     "tool_result_persist",
@@ -112,6 +115,16 @@ test("registerHooks wires lifecycle hooks that create and complete request spans
 
   typedHooks.get("before_agent_start")?.(
     { agentId: "planner", model: "claude-sonnet-4", conversationId: sessionKey },
+    hookCtx
+  );
+
+  typedHooks.get("before_tool_call")?.(
+    {
+      toolName: "Read",
+      toolCallId: "tool-1",
+      input: { filePath: "/tmp/.env" },
+      conversationId: sessionKey,
+    },
     hookCtx
   );
 
@@ -221,6 +234,16 @@ test("registerHooks links spawned subagent turns back to the spawning tool span"
 
   typedHooks.get("before_agent_start")?.(
     { agentId: "planner", model: "claude", conversationId: parentSession },
+    { conversationId: parentSession, channelId: "chat", agentId: "planner" }
+  );
+
+  typedHooks.get("before_tool_call")?.(
+    {
+      toolName: "sessions_spawn",
+      toolCallId: "spawn-1",
+      input: { targetAgentId: "reviewer" },
+      conversationId: parentSession,
+    },
     { conversationId: parentSession, channelId: "chat", agentId: "planner" }
   );
 

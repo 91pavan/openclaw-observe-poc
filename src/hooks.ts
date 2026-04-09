@@ -469,6 +469,9 @@ export function registerHooks(
     dangerousCommand: counters.dangerousCommand,
   };
 
+  // Spans created in before_tool_call, completed in tool_result_persist
+  const pendingToolSpans = new Map<string, Span>();
+
   api.on(
     "message_received",
     async (event: any, ctx: any) => {
@@ -675,6 +678,11 @@ export function registerHooks(
 
         const agentContext = trace.setSpan(parentContext, agentSpan);
 
+        // Expose the agent context globally so AgentAwareContextManager in preload.mjs
+        // can return it when context.active() has no span (broken async chain between
+        // hook dispatch and the auto-instrumented Anthropic/OpenAI call).
+        (globalThis as any).__OPENCLAW_ACTIVE_AGENT_CONTEXT = agentContext;
+
         // Store agent span context for tool spans
         if (sessionCtx) {
           sessionCtx.agentSpan = agentSpan;
@@ -692,10 +700,9 @@ export function registerHooks(
         // Register in activeAgentSpans for diagnostics integration
         activeAgentSpans.set(sessionKey, agentSpan);
 
-        logger.info(`[otel] Agent turn started: agent=${agentId}, model=${model}, session=${sessionKey}`);
+        logger.info?.(`[otel] Agent turn started: agent=${agentId}, model=${model}, session=${sessionKey}`);
       } catch (error) {
         logger.debug(`[otel] before_agent_start hook failed: ${String(error)}`);
-        // Silently ignore
       }
 
       // Return undefined - don't modify system prompt
@@ -706,22 +713,41 @@ export function registerHooks(
 
   logger.info("[otel] Registered before_agent_start hook (via api.on)");
 
-  // -- tool_result_persist ---------------------------------------------
-  // Creates a child span under the agent turn span for each tool call.
-  // SYNCHRONOUS - must not return a Promise.
+  api.on(
+    "before_model_resolve",
+    (event: any, ctx: any) => {
+      // Not implemented at the moment
+      return undefined;
+    }
+  );
+ logger.info("[otel] Registered before_model_resolve hook (via api.on)");
+  api.on(
+    "before_prompt_build",
+    (event: any, ctx: any) => {
+      // Not implemented at the moment
+      return undefined;
+    }
+  );
+  logger.info("[otel] Registered before_prompt_build hook (via api.on)");
+
+  // ── before_tool_call ─────────────────────────────────────────────
+  // Creates the tool span at call time, capturing input and running security
+  // checks. The span is stored in pendingToolSpans and closed in
+  // tool_result_persist once the output is available.
+  // SYNCHRONOUS — must not return a Promise.
 
   api.on(
-    "tool_result_persist",
+    "before_tool_call",
     (event: any, ctx: any) => {
       try {
-        const toolName = event?.toolName || "unknown";
-        const toolCallId = event?.toolCallId || "";
+        const toolName = event?.toolName || event?.name || "unknown";
+        const toolCallId = event?.toolCallId || event?.id || "";
         const isSynthetic = event?.isSynthetic === true;
         const sessionKey = resolveSessionKey(event, ctx);
         const agentId = ctx?.agentId || "unknown";
 
         // Tool input is available in event.input for security checks
-        const toolInput = event?.input || event?.toolInput || event?.args || {};
+        const toolInput = event?.input || event?.params || event?.toolInput || event?.args || {};
 
         // Record metric
         counters.toolCalls.add(1, {
@@ -790,6 +816,55 @@ export function registerHooks(
           }
         }
 
+        // Store span so tool_result_persist can add the output and close it
+        if (toolCallId) {
+          pendingToolSpans.set(toolCallId, span);
+        } else {
+          // No toolCallId to key on — close immediately with no output
+          span.setStatus({ code: SpanStatusCode.OK });
+          span.end();
+        }
+
+        logger.info?.(`[otel] Tool span started: tool=${toolName}, callId=${toolCallId}, session=${sessionKey}`);
+      } catch {
+        // Never let telemetry errors break the main flow
+      }
+      return undefined;
+    }
+  );
+
+  // ── tool_result_persist ──────────────────────────────────────────
+  // Looks up the span created in before_tool_call, attaches output metadata,
+  // and closes the span.
+  // SYNCHRONOUS — must not return a Promise.
+
+  api.on(
+    "tool_result_persist",
+    (event: any, ctx: any) => {
+      try {
+        const toolName = event?.toolName || "unknown";
+        const toolCallId = event?.toolCallId || "";
+        const sessionKey = resolveSessionKey(event, ctx);
+        const agentId = ctx?.agentId || "unknown";
+
+        // Retrieve the span opened in before_tool_call
+        const span = toolCallId ? pendingToolSpans.get(toolCallId) : undefined;
+        if (!span) {
+          logger.warn?.(`[otel] No pending span for toolCallId=${toolCallId}, tool=${toolName} — skipping output capture`);
+          return undefined;
+        }
+        pendingToolSpans.delete(toolCallId);
+
+        // Prefer toolInput captured on the span in before_tool_call; fall back to event fields.
+        const toolInput =
+          (span as any).attributes?.["openclaw.tool.input"] ??
+          (span as any).attributes?.[ATTR_OBSERVE_ENTITY_INPUT] ??
+          event?.input ?? event?.params ?? event?.toolInput ?? event?.args;
+
+        const sessionCtx = getSessionTraceContext(event, ctx);
+        const parentContext = sessionCtx?.agentContext || sessionCtx?.rootContext || context.active();
+
+        const agentSequence = getHandoffSequence(sessionKey);
         // Inspect the message for result metadata
         const message = event?.message;
         if (message) {
@@ -844,15 +919,15 @@ export function registerHooks(
           if (message?.is_error === true || message?.isError === true) {
             counters.toolErrors.add(1, { "tool.name": toolName });
             span.setStatus({ code: SpanStatusCode.ERROR, message: "Tool execution error" });
-          } else if (!securityEvent) {
-            // Only set OK status if no security event
+          } else {
             span.setStatus({ code: SpanStatusCode.OK });
           }
-        } else if (!securityEvent) {
+        } else {
           span.setStatus({ code: SpanStatusCode.OK });
         }
 
         span.end();
+        logger.info?.(`[otel] Tool span ended: tool=${toolName}, callId=${toolCallId}, session=${sessionKey}`);
       } catch {
         // Never let telemetry errors break the main flow
       }
@@ -1051,6 +1126,8 @@ export function registerHooks(
         activeAgentSpans.delete(sessionKey);
         cleanupHandoff(sessionKey);
         cleanupForkJoin(sessionKey);
+        // Clear the global agent context fallback set in before_agent_start
+        (globalThis as any).__OPENCLAW_ACTIVE_AGENT_CONTEXT = undefined;
 
         logger.info(`[otel] Trace completed for session=${sessionKey}`);
       } catch (error) {
