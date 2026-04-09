@@ -9,6 +9,8 @@
     ]
   },
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "package:artifact": "node ./scripts/prepare-artifact.mjs",
     "test": "tsx --test tests/*.test.ts",
     "ci-test": "npm test",
     "typecheck": "tsc --noEmit",
