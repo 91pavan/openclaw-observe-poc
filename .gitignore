@@ -6,3 +6,13 @@ dist/
 !collector/**
 .env
 collector/otelcol-contrib_0.144.0_linux_amd64.deb
+
+
+.tmp-dist
+
+.idea/
+.vscode/
+.DS_Store
+*.log
+
+artifact/
